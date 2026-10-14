@@ -3,7 +3,7 @@ import { formatSqlLayout, type SqlLayoutOptions } from "@/lib/sql/layout";
 import { looksLikeXml } from "@/lib/sql/autoFormat";
 import { compressCypherText, formatCypherText } from "@/lib/sql/cypherFormatter";
 
-export type SqlFormatDialect = "mysql" | "postgres" | "sqlite" | "sqlserver" | "oracle" | "clickhouse" | "dameng" | "duckdb" | "cypher" | "generic";
+export type SqlFormatDialect = "mysql" | "postgres" | "sqlite" | "sqlserver" | "oracle" | "clickhouse" | "dameng" | "duckdb" | "cypher" | "saphana" | "generic";
 
 export const MAX_SQL_FORMAT_CHARS = 1_000_000;
 
@@ -81,6 +81,29 @@ function resolveOracleExtendedDialect(sqlFormatter: SqlFormatterModule): SqlForm
   return oracleExtendedDialect;
 }
 
+// SAP HANA SQL uses only double-quoted identifiers ("name") and single-quoted
+// string literals ('value') with '' doubling. The generic "sql" dialect also
+// accepts backtick identifiers and backslash escapes in strings, neither of
+// which HANA supports. Patch them out so the tokenizer treats backtick-containing
+// SQL correctly and does not corrupt strings that contain backslashes.
+let sapHanaDialect: SqlFormatterModule["sql"] | null = null;
+
+function resolveSapHanaDialect(sqlFormatter: SqlFormatterModule): SqlFormatterModule["sql"] {
+  if (sapHanaDialect) return sapHanaDialect;
+
+  sapHanaDialect = {
+    ...sqlFormatter.sql,
+    tokenizerOptions: {
+      ...sqlFormatter.sql.tokenizerOptions,
+      // Remove backtick from identifier quotes: HANA only uses "..."
+      identTypes: [`""-qq`],
+      // Remove backslash-escape variant: HANA strings use '' doubling only
+      stringTypes: [{ quote: "''-qq", prefixes: ["N"] }],
+    },
+  };
+  return sapHanaDialect;
+}
+
 export function canFormatSqlForDatabaseType(dbType: string | null | undefined): boolean {
   return dbType !== "redis" && dbType !== "victoriametrics";
 }
@@ -143,6 +166,8 @@ export function sqlFormatDialectForDbType(dbType: string | null | undefined): Sq
       return "duckdb";
     case "neo4j":
       return "cypher";
+    case "saphana":
+      return "saphana";
     default:
       return "generic";
   }
@@ -162,6 +187,8 @@ function formatterLanguage(dialect: SqlFormatDialect) {
       return "plsql";
     case "clickhouse":
       return "clickhouse";
+    case "saphana":
+      return "sql";
     default:
       return "sql";
   }
@@ -432,7 +459,8 @@ export async function formatSqlText(sql: string, dialect: SqlFormatDialect = "ge
           },
         }
       : options;
-  const resolvedDialect = dialect === "mysql" ? resolveMysqlFunctionSafeDialect(sqlFormatter) : dialect === "clickhouse" ? resolveClickHouseIdentifierSafeDialect(sqlFormatter) : dialect === "oracle" ? resolveOracleExtendedDialect(sqlFormatter) : undefined;
+  const resolvedDialect =
+    dialect === "mysql" ? resolveMysqlFunctionSafeDialect(sqlFormatter) : dialect === "clickhouse" ? resolveClickHouseIdentifierSafeDialect(sqlFormatter) : dialect === "oracle" ? resolveOracleExtendedDialect(sqlFormatter) : dialect === "saphana" ? resolveSapHanaDialect(sqlFormatter) : undefined;
   const formatWithFallback = (input: string): string => {
     try {
       if (resolvedDialect) {

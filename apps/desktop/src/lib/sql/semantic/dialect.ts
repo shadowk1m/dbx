@@ -161,6 +161,16 @@ export const SQL_SEMANTIC_DIALECTS: Record<string, SqlSemanticDialectAdapter> = 
     quoteIdentifier: (identifier) => quoteWith(identifier, '"'),
     qualifierRole: roleForGenericQualifier,
   },
+  saphana: {
+    id: "saphana",
+    identifierQuotes: [{ open: '"', close: '"' }],
+    supportsAsForTableAlias: true,
+    projectionAliasVisibility: defaultProjectionAliasVisibility,
+    // Unquoted identifiers are folded to uppercase in SAP HANA
+    normalizeIdentifier: upperUnquoted,
+    quoteIdentifier: (identifier) => quoteWith(identifier, '"'),
+    qualifierRole: roleForGenericQualifier,
+  },
   oracle: {
     id: "oracle",
     identifierQuotes: [{ open: '"', close: '"' }],
@@ -227,6 +237,8 @@ export function sqlSemanticDialectFor(options: { databaseType?: DatabaseType; di
       return SQL_SEMANTIC_DIALECTS.sqlite;
     case "duckdb":
       return SQL_SEMANTIC_DIALECTS.duckdb;
+    case "saphana":
+      return SQL_SEMANTIC_DIALECTS.saphana;
     case "oracle":
     case "oceanbase-oracle":
     case "dameng":

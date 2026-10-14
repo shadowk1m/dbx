@@ -111,6 +111,29 @@ describe("sqlFormatter", () => {
     expect(sqlFormatDialectForDbType("dameng")).toBe("dameng");
   });
 
+  it("maps SAP HANA to its scoped formatter dialect", () => {
+    expect(sqlFormatDialectForDbType("saphana")).toBe("saphana");
+  });
+
+  it("formats SAP HANA SQL using double-quote identifiers and single-quote strings", async () => {
+    const sql = `SELECT "SCHEMA"."TABLE"."COLUMN" FROM "SCHEMA"."TABLE" WHERE "COLUMN" = 'value'`;
+    const formatted = await formatSqlForEditing(sql, sqlFormatDialectForDbType("saphana"));
+    // Double-quoted identifiers must be preserved intact
+    expect(formatted).toContain('"SCHEMA"."TABLE"."COLUMN"');
+    expect(formatted).toContain('"SCHEMA"."TABLE"');
+    // Single-quoted string value must be preserved intact
+    expect(formatted).toContain("'value'");
+  });
+
+  it("does not treat backticks as identifier quotes in SAP HANA SQL", async () => {
+    // Backticks are not valid in HANA SQL; the formatter must not consume them
+    // as identifier delimiters or silently rewrite them.
+    const sql = "SELECT * FROM ORDERS WHERE STATUS = 'open'";
+    const formatted = await formatSqlForEditing(sql, sqlFormatDialectForDbType("saphana"));
+    expect(formatted).not.toContain("`");
+    expect(formatted).toContain("'open'");
+  });
+
   it("maps DuckDB to its scoped formatter dialect", () => {
     expect(sqlFormatDialectForDbType("duckdb")).toBe("duckdb");
   });

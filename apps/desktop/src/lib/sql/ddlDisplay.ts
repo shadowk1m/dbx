@@ -35,6 +35,7 @@ function canRenderUnquoted(identifier: string, dialect: SqlFormatDialect): boole
     case "postgres":
     case "sqlite":
     case "duckdb":
+    case "saphana":
     case "generic":
       return !requiresPostgresIdentifierQuote(identifier);
     case "dameng":
