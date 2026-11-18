@@ -9,6 +9,8 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import PasswordInput from "@/components/ui/PasswordInput.vue";
 import SavePasswordCheckbox from "@/components/connection/SavePasswordCheckbox.vue";
+import CfSshFields from "@/components/connection/CfSshFields.vue";
+import { cfSshConfigError } from "@/lib/connection/cfSsh";
 import ConnectionParametersDialog from "@/components/connection/ConnectionParametersDialog.vue";
 import { parseConnectionParameters, patchConnectionParameter } from "@/lib/connection/connectionParameterDocument";
 import { connectionParameterSyntax, type ConnectionParameterDefinition } from "@/lib/connection/connectionParameterCatalog";
@@ -604,6 +606,7 @@ function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
     allow_exec_channel_proxy: !!hop.allow_exec_channel_proxy,
     proxy_command: hop.proxy_command || "",
     profile_id: hop.profile_id || undefined,
+    cf: hop.cf ? { ...hop.cf } : undefined,
   };
 }
 
@@ -3601,7 +3604,7 @@ const selectedProxyLayer = computed(() => (selectedTransportLayer.value?.type ==
 const selectedHttpTunnelLayer = computed(() => (selectedTransportLayer.value?.type === "http_tunnel" ? selectedTransportLayer.value : null));
 
 const tunnelProfiles = computed(() => {
-  const profiles = tunnelProfileStore.profiles;
+  const profiles = tunnelProfileStore.profiles.filter((profile) => form.value.db_type === "saphana" || profile.type !== "ssh" || !profile.cf);
   if (!sqliteRemoteTransportRestricted.value) return profiles;
   return profiles.filter((profile) => isSqliteRemoteTransportLayerType(profile.type));
 });
@@ -3642,6 +3645,7 @@ function transportLayerDisplayName(layer: TransportLayerConfig, index: number): 
     if (profile) return profile.name?.trim() || tunnelProfileSummary(profile) || transportLayerDefaultName(layer, index);
     return layer.name?.trim() || t("connection.tunnelProfileMissingName");
   }
+  if (layer.type === "ssh" && layer.cf) return layer.name?.trim() || `CF: ${layer.cf.app || layer.cf.api_endpoint}`;
   const target = layer.type === "http_tunnel" ? layer.url?.trim() : layer.host?.trim();
   return layer.name?.trim() || target || transportLayerDefaultName(layer, index);
 }
@@ -7001,6 +7005,14 @@ function validateTransportLayers(config: LegacyConnectionConfig) {
     // whole configuration at connect time, so there is nothing to validate.
     if (layer.profile_id) return;
     const label = layer.name?.trim() || transportLayerDefaultName(layer, index);
+    if (layer.type === "ssh" && layer.cf) {
+      if (config.db_type !== "saphana") throw new Error("Cloud Foundry SSH is only supported for SAP HANA connections");
+      if (layers.filter((candidate) => candidate.enabled !== false).length !== 1) throw new Error("Cloud Foundry SSH must be the only transport layer");
+      const error = cfSshConfigError(layer.cf);
+      if (error) throw new Error(error);
+      if (layer.expose_lan) throw new Error("Cloud Foundry SSH cannot expose its forward to the LAN");
+      return;
+    }
     if (layer.type === "http_tunnel") {
       if (index !== 0) throw new Error(t("connection.httpTunnelInvalidOrder", { hop: label }));
       if (!layer.url?.trim()) throw new Error(t("connection.httpTunnelInvalidUrl", { hop: label }));
@@ -11268,122 +11280,125 @@ function openExternalUrl(url: string) {
                     </div>
                   </div>
                   <template v-if="selectedSshLayer && !selectedLayerProfileId">
-                    <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshHost") }}</Label>
-                      <Input v-model="selectedSshLayer.host" class="col-span-2" list="ssh-config-host-aliases" :placeholder="t('connection.sshHostPlaceholder')" :disabled="selectedSshLayer.enabled === false" @change="applySshConfigHostAliasPrefill(selectedSshLayer!)" />
-                      <datalist id="ssh-config-host-aliases">
-                        <option v-for="alias in sshConfigHostAliases" :key="alias" :value="alias" />
-                      </datalist>
-                      <Input v-model.number="selectedSshLayer.port" type="number" min="1" max="65535" class="col-span-1" :disabled="selectedSshLayer.enabled === false" />
-                    </div>
-                    <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshUser") }}</Label>
-                      <Input v-model="selectedSshLayer.user" class="col-span-3" placeholder="root" :disabled="selectedSshLayer.enabled === false" />
-                    </div>
-                    <div class="grid min-w-0 grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshAuthMethod") }}</Label>
-                      <div class="col-span-3 min-w-0">
-                        <Select :model-value="selectedSshLayer.auth_method || 'password'" :disabled="selectedSshLayer.enabled === false" @update:model-value="updateSelectedSshAuthMethod">
-                          <SelectTrigger class="h-9 w-full min-w-0">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="password">{{ t("connection.sshAuthMethodPassword") }}</SelectItem>
-                            <SelectItem value="key">{{ t("connection.sshAuthMethodKey") }}</SelectItem>
-                            <SelectItem value="key+password">{{ t("connection.sshAuthMethodKeyPassword") }}</SelectItem>
-                            <SelectItem value="agent">{{ t("connection.sshUseAgent") }}</SelectItem>
-                            <SelectItem value="none">{{ t("connection.sshAuthMethodNone") }}</SelectItem>
-                          </SelectContent>
-                        </Select>
+                    <CfSshFields v-if="form.db_type === 'saphana' || selectedSshLayer.cf" :layer="selectedSshLayer" />
+                    <template v-if="!selectedSshLayer.cf">
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshHost") }}</Label>
+                        <Input v-model="selectedSshLayer.host" class="col-span-2" list="ssh-config-host-aliases" :placeholder="t('connection.sshHostPlaceholder')" :disabled="selectedSshLayer.enabled === false" @change="applySshConfigHostAliasPrefill(selectedSshLayer!)" />
+                        <datalist id="ssh-config-host-aliases">
+                          <option v-for="alias in sshConfigHostAliases" :key="alias" :value="alias" />
+                        </datalist>
+                        <Input v-model.number="selectedSshLayer.port" type="number" min="1" max="65535" class="col-span-1" :disabled="selectedSshLayer.enabled === false" />
                       </div>
-                    </div>
-                    <div v-if="selectedSshLayer.auth_method === 'key' || selectedSshLayer.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshKeyPath") }}</Label>
-                      <div class="col-span-3 flex items-center gap-1">
-                        <Input v-model="selectedSshLayer.key_path" class="flex-1" placeholder="~/.ssh/id_rsa" :disabled="selectedSshLayer.enabled === false" />
-                        <Tooltip v-if="isDesktop">
-                          <TooltipTrigger as-child>
-                            <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" :disabled="selectedSshLayer.enabled === false" @click="browseSshKeyPath(selectedSshLayer)">
-                              <FolderOpen class="h-4 w-4" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>{{ t("connection.sshKeyPathBrowse") }}</TooltipContent>
-                        </Tooltip>
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshUser") }}</Label>
+                        <Input v-model="selectedSshLayer.user" class="col-span-3" placeholder="root" :disabled="selectedSshLayer.enabled === false" />
                       </div>
-                    </div>
-                    <div v-if="selectedSshLayer.auth_method === 'key' || selectedSshLayer.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshKeyPassphrase") }}</Label>
-                      <PasswordInput v-model="selectedSshLayer.key_passphrase" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" :disabled="selectedSshLayer.enabled === false" />
-                    </div>
-                    <div v-if="!selectedSshLayer.auth_method || selectedSshLayer.auth_method === 'password' || selectedSshLayer.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshPassword") }}</Label>
-                      <PasswordInput v-model="selectedSshLayer.password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
-                    </div>
-                    <div v-if="selectedSshLayer.auth_method === 'none'" class="grid grid-cols-4 items-center gap-4">
-                      <span />
-                      <p class="col-span-3 text-xs text-muted-foreground">{{ t("connection.sshAuthMethodNoneHint") }}</p>
-                    </div>
-                    <div v-if="selectedSshLayer.auth_method === 'agent'" class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshAgentSockPath") }}</Label>
-                      <Input v-model="selectedSshLayer.ssh_agent_sock_path" class="col-span-3" :placeholder="t('connection.sshAgentSockPathPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
-                    </div>
-                    <div v-if="selectedSshLayer.auth_method === 'agent'" class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshAgentKey") }}</Label>
-                      <div class="col-span-3 flex min-w-0 items-center gap-1">
-                        <div class="min-w-0 flex-1">
-                          <Select :model-value="selectedSshLayer.ssh_agent_key_fingerprint || SSH_AGENT_ALL_IDENTITIES" :disabled="selectedSshLayer.enabled === false" @update:model-value="updateSelectedSshAgentKeyFingerprint">
+                      <div class="grid min-w-0 grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshAuthMethod") }}</Label>
+                        <div class="col-span-3 min-w-0">
+                          <Select :model-value="selectedSshLayer.auth_method || 'password'" :disabled="selectedSshLayer.enabled === false" @update:model-value="updateSelectedSshAuthMethod">
                             <SelectTrigger class="h-9 w-full min-w-0">
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
-                              <SelectItem :value="SSH_AGENT_ALL_IDENTITIES">{{ t("connection.sshAgentKeyAll") }}</SelectItem>
-                              <SelectItem v-for="identity in sshAgentIdentityOptions" :key="identity.fingerprint" :value="identity.fingerprint" :title="identity.fingerprint">
-                                {{ sshAgentIdentityLabel(identity) }}
-                              </SelectItem>
+                              <SelectItem value="password">{{ t("connection.sshAuthMethodPassword") }}</SelectItem>
+                              <SelectItem value="key">{{ t("connection.sshAuthMethodKey") }}</SelectItem>
+                              <SelectItem value="key+password">{{ t("connection.sshAuthMethodKeyPassword") }}</SelectItem>
+                              <SelectItem value="agent">{{ t("connection.sshUseAgent") }}</SelectItem>
+                              <SelectItem value="none">{{ t("connection.sshAuthMethodNone") }}</SelectItem>
                             </SelectContent>
                           </Select>
                         </div>
-                        <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" :title="t('connection.sshAgentKeyRefresh')" :disabled="selectedSshLayer.enabled === false || sshAgentIdentitiesLoading" @click="loadSshAgentIdentities(selectedSshLayer.ssh_agent_sock_path || '')">
-                          <Loader2 v-if="sshAgentIdentitiesLoading" class="h-4 w-4 animate-spin" />
-                          <RefreshCw v-else class="h-4 w-4" />
-                        </Button>
                       </div>
-                    </div>
-                    <div v-if="selectedSshLayer.auth_method === 'agent'" class="grid grid-cols-4 items-start gap-4">
-                      <span />
-                      <div class="col-span-3 text-xs text-muted-foreground">
-                        <p>{{ t("connection.sshAgentKeyHint") }}</p>
-                        <p v-if="sshAgentIdentitiesError" class="mt-1">{{ sshAgentIdentitiesError }}</p>
+                      <div v-if="selectedSshLayer.auth_method === 'key' || selectedSshLayer.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshKeyPath") }}</Label>
+                        <div class="col-span-3 flex items-center gap-1">
+                          <Input v-model="selectedSshLayer.key_path" class="flex-1" placeholder="~/.ssh/id_rsa" :disabled="selectedSshLayer.enabled === false" />
+                          <Tooltip v-if="isDesktop">
+                            <TooltipTrigger as-child>
+                              <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" :disabled="selectedSshLayer.enabled === false" @click="browseSshKeyPath(selectedSshLayer)">
+                                <FolderOpen class="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{{ t("connection.sshKeyPathBrowse") }}</TooltipContent>
+                          </Tooltip>
+                        </div>
                       </div>
-                    </div>
-                    <div class="grid grid-cols-4 items-center gap-4">
-                      <span />
-                      <label class="col-span-3 flex items-center gap-2 cursor-pointer">
-                        <input type="checkbox" v-model="selectedSshLayer.expose_lan" class="mr-0" :disabled="selectedSshLayer.enabled === false" />
-                        <span class="text-sm text-muted-foreground">{{ t("connection.sshExposeLan") }}</span>
-                      </label>
-                    </div>
-                    <div class="grid grid-cols-4 items-start gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshLocalPort") }}</Label>
-                      <div class="col-span-3 space-y-1">
-                        <Input :model-value="selectedSshLayer.local_port ?? ''" type="number" min="1" max="65535" step="1" :placeholder="t('connection.sshLocalPortPlaceholder')" :disabled="selectedSshLayer.enabled === false" @update:model-value="updateSelectedSshLocalPort" />
-                        <p class="text-xs text-muted-foreground">{{ t("connection.sshLocalPortHint") }}</p>
+                      <div v-if="selectedSshLayer.auth_method === 'key' || selectedSshLayer.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshKeyPassphrase") }}</Label>
+                        <PasswordInput v-model="selectedSshLayer.key_passphrase" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" :disabled="selectedSshLayer.enabled === false" />
                       </div>
-                    </div>
-                    <div class="grid grid-cols-4 items-start gap-4">
-                      <span />
-                      <label class="col-span-3 flex items-start gap-2 cursor-pointer">
-                        <input type="checkbox" v-model="selectedSshLayer.allow_exec_channel_proxy" class="mt-0.5 mr-0" :disabled="selectedSshLayer.enabled === false" />
-                        <span class="text-sm text-muted-foreground">{{ t("connection.sshAllowExecChannelProxy") }}</span>
-                      </label>
-                    </div>
-                    <div class="grid grid-cols-4 items-start gap-4">
-                      <Label :class="connectionLabelSmallClass">{{ t("connection.sshProxyCommand") }}</Label>
-                      <div class="col-span-3 space-y-1">
-                        <Input v-model="selectedSshLayer.proxy_command" :placeholder="t('connection.sshProxyCommandPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
-                        <p class="text-xs text-muted-foreground">{{ t("connection.sshProxyCommandHint") }}</p>
+                      <div v-if="!selectedSshLayer.auth_method || selectedSshLayer.auth_method === 'password' || selectedSshLayer.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshPassword") }}</Label>
+                        <PasswordInput v-model="selectedSshLayer.password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
                       </div>
-                    </div>
+                      <div v-if="selectedSshLayer.auth_method === 'none'" class="grid grid-cols-4 items-center gap-4">
+                        <span />
+                        <p class="col-span-3 text-xs text-muted-foreground">{{ t("connection.sshAuthMethodNoneHint") }}</p>
+                      </div>
+                      <div v-if="selectedSshLayer.auth_method === 'agent'" class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshAgentSockPath") }}</Label>
+                        <Input v-model="selectedSshLayer.ssh_agent_sock_path" class="col-span-3" :placeholder="t('connection.sshAgentSockPathPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                      </div>
+                      <div v-if="selectedSshLayer.auth_method === 'agent'" class="grid grid-cols-4 items-center gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshAgentKey") }}</Label>
+                        <div class="col-span-3 flex min-w-0 items-center gap-1">
+                          <div class="min-w-0 flex-1">
+                            <Select :model-value="selectedSshLayer.ssh_agent_key_fingerprint || SSH_AGENT_ALL_IDENTITIES" :disabled="selectedSshLayer.enabled === false" @update:model-value="updateSelectedSshAgentKeyFingerprint">
+                              <SelectTrigger class="h-9 w-full min-w-0">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem :value="SSH_AGENT_ALL_IDENTITIES">{{ t("connection.sshAgentKeyAll") }}</SelectItem>
+                                <SelectItem v-for="identity in sshAgentIdentityOptions" :key="identity.fingerprint" :value="identity.fingerprint" :title="identity.fingerprint">
+                                  {{ sshAgentIdentityLabel(identity) }}
+                                </SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" :title="t('connection.sshAgentKeyRefresh')" :disabled="selectedSshLayer.enabled === false || sshAgentIdentitiesLoading" @click="loadSshAgentIdentities(selectedSshLayer.ssh_agent_sock_path || '')">
+                            <Loader2 v-if="sshAgentIdentitiesLoading" class="h-4 w-4 animate-spin" />
+                            <RefreshCw v-else class="h-4 w-4" />
+                          </Button>
+                        </div>
+                      </div>
+                      <div v-if="selectedSshLayer.auth_method === 'agent'" class="grid grid-cols-4 items-start gap-4">
+                        <span />
+                        <div class="col-span-3 text-xs text-muted-foreground">
+                          <p>{{ t("connection.sshAgentKeyHint") }}</p>
+                          <p v-if="sshAgentIdentitiesError" class="mt-1">{{ sshAgentIdentitiesError }}</p>
+                        </div>
+                      </div>
+                      <div class="grid grid-cols-4 items-center gap-4">
+                        <span />
+                        <label class="col-span-3 flex items-center gap-2 cursor-pointer">
+                          <input type="checkbox" v-model="selectedSshLayer.expose_lan" class="mr-0" :disabled="selectedSshLayer.enabled === false" />
+                          <span class="text-sm text-muted-foreground">{{ t("connection.sshExposeLan") }}</span>
+                        </label>
+                      </div>
+                      <div class="grid grid-cols-4 items-start gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshLocalPort") }}</Label>
+                        <div class="col-span-3 space-y-1">
+                          <Input :model-value="selectedSshLayer.local_port ?? ''" type="number" min="1" max="65535" step="1" :placeholder="t('connection.sshLocalPortPlaceholder')" :disabled="selectedSshLayer.enabled === false" @update:model-value="updateSelectedSshLocalPort" />
+                          <p class="text-xs text-muted-foreground">{{ t("connection.sshLocalPortHint") }}</p>
+                        </div>
+                      </div>
+                      <div class="grid grid-cols-4 items-start gap-4">
+                        <span />
+                        <label class="col-span-3 flex items-start gap-2 cursor-pointer">
+                          <input type="checkbox" v-model="selectedSshLayer.allow_exec_channel_proxy" class="mt-0.5 mr-0" :disabled="selectedSshLayer.enabled === false" />
+                          <span class="text-sm text-muted-foreground">{{ t("connection.sshAllowExecChannelProxy") }}</span>
+                        </label>
+                      </div>
+                      <div class="grid grid-cols-4 items-start gap-4">
+                        <Label :class="connectionLabelSmallClass">{{ t("connection.sshProxyCommand") }}</Label>
+                        <div class="col-span-3 space-y-1">
+                          <Input v-model="selectedSshLayer.proxy_command" :placeholder="t('connection.sshProxyCommandPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                          <p class="text-xs text-muted-foreground">{{ t("connection.sshProxyCommandHint") }}</p>
+                        </div>
+                      </div>
+                    </template>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.sshConnectTimeout") }}</Label>
                       <Input v-model.number="selectedSshLayer.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" :disabled="selectedSshLayer.enabled === false" />

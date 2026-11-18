@@ -4217,6 +4217,7 @@ mod tests {
                     auth_method: "password".to_string(),
                     allow_exec_channel_proxy: false,
                     proxy_command: String::new(),
+                    cf: None,
                 }),
                 TransportLayerConfig::HttpTunnel(crate::models::connection::HttpTunnelConfig {
                     profile_id: String::new(),
@@ -5906,6 +5907,7 @@ mod tests {
             auth_method: "password".to_string(),
             allow_exec_channel_proxy: false,
             proxy_command: String::new(),
+            cf: None,
             profile_id: String::new(),
         });
         storage.save_tunnel_profiles(std::slice::from_ref(&profile)).await.unwrap();

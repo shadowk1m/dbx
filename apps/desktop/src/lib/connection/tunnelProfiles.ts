@@ -74,6 +74,7 @@ export function createTunnelProfile(type: TunnelProfileType): TunnelProfile {
 
 export function tunnelProfileSummary(profile: TunnelProfile): string {
   if (profile.type === "ssh") {
+    if (profile.cf) return `CF: ${profile.cf.org}/${profile.cf.space}/${profile.cf.app} [${profile.cf.instance_index}]`;
     if (!profile.host) return "";
     const user = profile.user ? `${profile.user}@` : "";
     return `${user}${profile.host}:${profile.port || 22}`;

@@ -1708,6 +1708,12 @@ struct TunnelEntry {
     kind: TunnelKind,
 }
 
+struct CfTunnelEntry {
+    child: tokio::process::Child,
+    local_port: u16,
+    _session: Arc<super::cf_ssh::CfSession>,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlannedTunnel {
@@ -1721,6 +1727,8 @@ struct PlannedTunnel {
 
 pub struct TunnelManager {
     tunnels: Mutex<HashMap<String, TunnelEntry>>,
+    cf_tunnels: Mutex<HashMap<String, CfTunnelEntry>>,
+    cf_sessions: super::cf_ssh::CfSessions,
     start_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// dbx-managed known_hosts path (`<data_dir>/known_hosts`) threaded into
     /// every SSH connection for host-key verification.
@@ -1736,11 +1744,54 @@ impl Default for TunnelManager {
 impl TunnelManager {
     pub fn new(data_dir: PathBuf) -> Self {
         let known_hosts_path = data_dir.join("known_hosts");
-        Self { tunnels: Mutex::new(HashMap::new()), start_locks: Mutex::new(HashMap::new()), known_hosts_path }
+        Self {
+            tunnels: Mutex::new(HashMap::new()),
+            cf_tunnels: Mutex::new(HashMap::new()),
+            cf_sessions: Default::default(),
+            start_locks: Mutex::new(HashMap::new()),
+            known_hosts_path,
+        }
     }
 
     pub fn known_hosts_path(&self) -> &Path {
         &self.known_hosts_path
+    }
+
+    pub async fn start_cf_tunnel(
+        &self,
+        connection_id: &str,
+        config: &crate::models::connection::CfSshConfig,
+        remote_host: &str,
+        remote_port: u16,
+        local_port: Option<u16>,
+        connect_timeout_secs: u64,
+    ) -> Result<u16, String> {
+        let start_lock = self.start_lock(connection_id).await;
+        let _guard = start_lock.lock().await;
+        let previous = {
+            let mut tunnels = self.cf_tunnels.lock().await;
+            if let Some(entry) = tunnels.get_mut(connection_id) {
+                if entry.child.try_wait().map_err(|_| "Unable to check CF SSH process")?.is_none()
+                    && local_port.is_none_or(|requested| requested == entry.local_port)
+                {
+                    return Ok(entry.local_port);
+                }
+            }
+            tunnels.remove(connection_id)
+        };
+        if let Some(mut previous) = previous {
+            let _ = previous.child.kill().await;
+        }
+        let data_dir = self.known_hosts_path.parent().unwrap_or_else(|| Path::new("."));
+        let session = self.cf_sessions.session(config, data_dir).await?;
+        let (child, local_port) =
+            super::cf_ssh::start_forward(&session, config, remote_host, remote_port, local_port, connect_timeout_secs)
+                .await?;
+        self.cf_tunnels
+            .lock()
+            .await
+            .insert(connection_id.to_string(), CfTunnelEntry { child, local_port, _session: session });
+        Ok(local_port)
     }
 
     async fn start_lock(&self, connection_id: &str) -> Arc<Mutex<()>> {
@@ -2106,6 +2157,16 @@ impl TunnelManager {
     /// for this connection" can't be handed a port with no live SSH session
     /// behind it — the same bug this fix closes for `start_tunnel` et al.
     pub async fn local_port(&self, connection_id: &str) -> Option<u16> {
+        {
+            let mut tunnels = self.cf_tunnels.lock().await;
+            if let Some(entry) = tunnels.get_mut(connection_id) {
+                if entry.child.try_wait().ok().is_some_and(|status| status.is_none()) {
+                    return Some(entry.local_port);
+                }
+                tunnels.remove(connection_id);
+                return None;
+            }
+        }
         let (local_port, evicted) = {
             let mut tunnels = self.tunnels.lock().await;
             let entry = tunnels.get(connection_id)?;
@@ -2127,6 +2188,13 @@ impl TunnelManager {
         let start_lock = self.start_lock(connection_id).await;
         let _start_guard = start_lock.lock().await;
 
+        let cf = self.cf_tunnels.lock().await.remove(connection_id);
+        if let Some(mut cf) = cf {
+            // kill() also waits/reaps: the listener is closed before returning,
+            // including when the next connection reuses a fixed local port.
+            let _ = cf.child.kill().await;
+        }
+
         let removed = self.tunnels.lock().await.remove(connection_id);
         if let Some(entry) = removed {
             abort_and_join(entry.handles).await;
@@ -2141,17 +2209,23 @@ impl TunnelManager {
     }
 
     pub async fn stop_tunnels_with_prefix(&self, connection_id_prefix: &str) {
-        let keys: Vec<String> =
+        let mut keys: Vec<String> =
             self.tunnels.lock().await.keys().filter(|key| key.starts_with(connection_id_prefix)).cloned().collect();
+        keys.extend(self.cf_tunnels.lock().await.keys().filter(|key| key.starts_with(connection_id_prefix)).cloned());
         for key in keys {
             self.stop_tunnel(&key).await;
         }
     }
 
     pub async fn stop_all_tunnels(&self) {
+        let cf_tunnels = std::mem::take(&mut *self.cf_tunnels.lock().await);
+        for mut entry in cf_tunnels.into_values() {
+            let _ = entry.child.kill().await;
+        }
         let tunnels = std::mem::take(&mut *self.tunnels.lock().await);
         abort_and_join(tunnels.into_values().flat_map(|entry| entry.handles).collect()).await;
         self.start_locks.lock().await.clear();
+        self.cf_sessions.clear().await;
     }
 }
 
@@ -2697,7 +2771,43 @@ mod tests {
             auth_method: "password".to_string(),
             allow_exec_channel_proxy: false,
             proxy_command: String::new(),
+            cf: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cf_tunnel_manager_stops_prefixes_and_releases_ports_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TunnelManager::new(dir.path().to_path_buf());
+        let session = Arc::new(crate::db::cf_ssh::tests::fake_session(dir.path()));
+        let config = crate::models::connection::CfSshConfig {
+            api_endpoint: "https://api.cf.example.com".into(),
+            org: "team".into(),
+            space: "dev".into(),
+            app: "proxy".into(),
+            instance_index: 0,
+        };
+        let mut ports = Vec::new();
+        for id in ["conn:transport:0", "other:transport:0"] {
+            let (child, port) =
+                crate::db::cf_ssh::start_forward(&session, &config, "hana.example.com", 443, None, 5).await.unwrap();
+            manager
+                .cf_tunnels
+                .lock()
+                .await
+                .insert(id.into(), super::CfTunnelEntry { child, local_port: port, _session: session.clone() });
+            assert_eq!(manager.local_port(id).await, Some(port));
+            ports.push(port);
+        }
+        manager.stop_tunnels_with_prefix("conn:").await;
+        assert_eq!(manager.local_port("conn:transport:0").await, None);
+        let first = tokio::net::TcpListener::bind(("127.0.0.1", ports[0])).await.unwrap();
+        assert_eq!(manager.local_port("other:transport:0").await, Some(ports[1]));
+        manager.stop_all_tunnels().await;
+        assert_eq!(manager.local_port("other:transport:0").await, None);
+        let second = tokio::net::TcpListener::bind(("127.0.0.1", ports[1])).await.unwrap();
+        drop((first, second));
     }
 
     #[test]

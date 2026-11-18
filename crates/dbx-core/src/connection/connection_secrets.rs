@@ -1194,6 +1194,7 @@ mod tests {
             auth_method: "key".to_string(),
             allow_exec_channel_proxy: false,
             proxy_command: String::new(),
+            cf: None,
         }
     }
 

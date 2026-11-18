@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import PasswordInput from "@/components/ui/PasswordInput.vue";
+import CfSshFields from "@/components/connection/CfSshFields.vue";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -304,101 +305,104 @@ async function testSelected() {
       </div>
 
       <template v-if="selectedSsh">
-        <div class="grid grid-cols-4 items-center gap-4">
-          <Label class="text-xs">{{ t("connection.sshHost") }}</Label>
-          <Input :model-value="selectedSsh.host" class="col-span-2" list="tunnel-profile-ssh-config-host-aliases" :placeholder="t('connection.sshHostPlaceholder')" @update:model-value="updateSelectedSshHost" />
-          <datalist id="tunnel-profile-ssh-config-host-aliases">
-            <option v-for="alias in sshConfigHostAliases" :key="alias" :value="alias" />
-          </datalist>
-          <Input v-model.number="selectedSsh.port" type="number" min="1" max="65535" class="col-span-1" />
-        </div>
-        <div class="grid grid-cols-4 items-center gap-4">
-          <Label class="text-xs">{{ t("connection.sshUser") }}</Label>
-          <Input v-model="selectedSsh.user" class="col-span-3" placeholder="root" />
-        </div>
-        <div class="grid min-w-0 grid-cols-4 items-center gap-4">
-          <Label class="text-xs">{{ t("connection.sshAuthMethod") }}</Label>
-          <div class="col-span-3 min-w-0">
-            <Select :model-value="selectedSsh.auth_method || 'password'" @update:model-value="updateSshAuthMethod">
-              <SelectTrigger class="h-9 w-full min-w-0">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="password">{{ t("connection.sshAuthMethodPassword") }}</SelectItem>
-                <SelectItem value="key">{{ t("connection.sshAuthMethodKey") }}</SelectItem>
-                <SelectItem value="key+password">{{ t("connection.sshAuthMethodKeyPassword") }}</SelectItem>
-                <SelectItem value="agent">{{ t("connection.sshUseAgent") }}</SelectItem>
-                <SelectItem value="none">{{ t("connection.sshAuthMethodNone") }}</SelectItem>
-              </SelectContent>
-            </Select>
+        <CfSshFields :layer="selectedSsh" />
+        <template v-if="!selectedSsh.cf">
+          <div class="grid grid-cols-4 items-center gap-4">
+            <Label class="text-xs">{{ t("connection.sshHost") }}</Label>
+            <Input :model-value="selectedSsh.host" class="col-span-2" list="tunnel-profile-ssh-config-host-aliases" :placeholder="t('connection.sshHostPlaceholder')" @update:model-value="updateSelectedSshHost" />
+            <datalist id="tunnel-profile-ssh-config-host-aliases">
+              <option v-for="alias in sshConfigHostAliases" :key="alias" :value="alias" />
+            </datalist>
+            <Input v-model.number="selectedSsh.port" type="number" min="1" max="65535" class="col-span-1" />
           </div>
-        </div>
-        <div v-if="!selectedSsh.auth_method || selectedSsh.auth_method === 'password' || selectedSsh.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
-          <Label class="text-xs">{{ t("connection.sshPassword") }}</Label>
-          <PasswordInput v-model="selectedSsh.password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" />
-        </div>
-        <div v-if="selectedSsh.auth_method === 'key' || selectedSsh.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
-          <Label class="text-xs">{{ t("connection.sshKeyPath") }}</Label>
-          <div class="col-span-3 flex items-center gap-1">
-            <Input v-model="selectedSsh.key_path" class="flex-1" placeholder="~/.ssh/id_rsa" />
-            <Tooltip v-if="isTauriRuntime()">
-              <TooltipTrigger as-child>
-                <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseSshKeyPath(selectedSsh)">
-                  <FolderOpen class="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{{ t("connection.sshKeyPathBrowse") }}</TooltipContent>
-            </Tooltip>
+          <div class="grid grid-cols-4 items-center gap-4">
+            <Label class="text-xs">{{ t("connection.sshUser") }}</Label>
+            <Input v-model="selectedSsh.user" class="col-span-3" placeholder="root" />
           </div>
-        </div>
-        <div v-if="selectedSsh.auth_method === 'key' || selectedSsh.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
-          <Label class="text-xs">{{ t("connection.sshKeyPassphrase") }}</Label>
-          <PasswordInput v-model="selectedSsh.key_passphrase" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" />
-        </div>
-        <div v-if="selectedSsh.auth_method === 'none'" class="grid grid-cols-4 items-center gap-4">
-          <span />
-          <p class="col-span-3 text-xs text-muted-foreground">{{ t("connection.sshAuthMethodNoneHint") }}</p>
-        </div>
-        <div v-if="selectedSsh.auth_method === 'agent'" class="grid grid-cols-4 items-center gap-4">
-          <Label class="text-xs">{{ t("connection.sshAgentSockPath") }}</Label>
-          <Input v-model="selectedSsh.ssh_agent_sock_path" class="col-span-3" :placeholder="t('connection.sshAgentSockPathPlaceholder')" />
-        </div>
-        <div v-if="selectedSsh.auth_method === 'agent'" class="grid grid-cols-4 items-center gap-4">
-          <Label class="text-xs">{{ t("connection.sshAgentKey") }}</Label>
-          <div class="col-span-3 flex min-w-0 items-center gap-1">
-            <div class="min-w-0 flex-1">
-              <Select :model-value="selectedSsh.ssh_agent_key_fingerprint || SSH_AGENT_ALL_IDENTITIES" @update:model-value="updateSelectedSshAgentKeyFingerprint">
+          <div class="grid min-w-0 grid-cols-4 items-center gap-4">
+            <Label class="text-xs">{{ t("connection.sshAuthMethod") }}</Label>
+            <div class="col-span-3 min-w-0">
+              <Select :model-value="selectedSsh.auth_method || 'password'" @update:model-value="updateSshAuthMethod">
                 <SelectTrigger class="h-9 w-full min-w-0">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem :value="SSH_AGENT_ALL_IDENTITIES">{{ t("connection.sshAgentKeyAll") }}</SelectItem>
-                  <SelectItem v-for="identity in sshAgentIdentityOptions" :key="identity.fingerprint" :value="identity.fingerprint" :title="identity.fingerprint">
-                    {{ sshAgentIdentityLabel(identity) }}
-                  </SelectItem>
+                  <SelectItem value="password">{{ t("connection.sshAuthMethodPassword") }}</SelectItem>
+                  <SelectItem value="key">{{ t("connection.sshAuthMethodKey") }}</SelectItem>
+                  <SelectItem value="key+password">{{ t("connection.sshAuthMethodKeyPassword") }}</SelectItem>
+                  <SelectItem value="agent">{{ t("connection.sshUseAgent") }}</SelectItem>
+                  <SelectItem value="none">{{ t("connection.sshAuthMethodNone") }}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
-            <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" :title="t('connection.sshAgentKeyRefresh')" :disabled="sshAgentIdentitiesLoading" @click="loadSshAgentIdentities(selectedSsh.ssh_agent_sock_path || '')">
-              <Loader2 v-if="sshAgentIdentitiesLoading" class="h-4 w-4 animate-spin" />
-              <RefreshCw v-else class="h-4 w-4" />
-            </Button>
           </div>
-        </div>
-        <div v-if="selectedSsh.auth_method === 'agent'" class="grid grid-cols-4 items-start gap-4">
-          <span />
-          <div class="col-span-3 text-xs text-muted-foreground">
-            <p>{{ t("connection.sshAgentKeyHint") }}</p>
-            <p v-if="sshAgentIdentitiesError" class="mt-1">{{ sshAgentIdentitiesError }}</p>
+          <div v-if="!selectedSsh.auth_method || selectedSsh.auth_method === 'password' || selectedSsh.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
+            <Label class="text-xs">{{ t("connection.sshPassword") }}</Label>
+            <PasswordInput v-model="selectedSsh.password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" />
           </div>
-        </div>
-        <div class="grid grid-cols-4 items-center gap-4">
-          <span />
-          <label class="col-span-3 flex cursor-pointer items-center gap-2">
-            <input v-model="selectedSsh.expose_lan" type="checkbox" class="mr-0" />
-            <span class="text-xs text-muted-foreground">{{ t("connection.sshExposeLan") }}</span>
-          </label>
-        </div>
+          <div v-if="selectedSsh.auth_method === 'key' || selectedSsh.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
+            <Label class="text-xs">{{ t("connection.sshKeyPath") }}</Label>
+            <div class="col-span-3 flex items-center gap-1">
+              <Input v-model="selectedSsh.key_path" class="flex-1" placeholder="~/.ssh/id_rsa" />
+              <Tooltip v-if="isTauriRuntime()">
+                <TooltipTrigger as-child>
+                  <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseSshKeyPath(selectedSsh)">
+                    <FolderOpen class="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{{ t("connection.sshKeyPathBrowse") }}</TooltipContent>
+              </Tooltip>
+            </div>
+          </div>
+          <div v-if="selectedSsh.auth_method === 'key' || selectedSsh.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
+            <Label class="text-xs">{{ t("connection.sshKeyPassphrase") }}</Label>
+            <PasswordInput v-model="selectedSsh.key_passphrase" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" />
+          </div>
+          <div v-if="selectedSsh.auth_method === 'none'" class="grid grid-cols-4 items-center gap-4">
+            <span />
+            <p class="col-span-3 text-xs text-muted-foreground">{{ t("connection.sshAuthMethodNoneHint") }}</p>
+          </div>
+          <div v-if="selectedSsh.auth_method === 'agent'" class="grid grid-cols-4 items-center gap-4">
+            <Label class="text-xs">{{ t("connection.sshAgentSockPath") }}</Label>
+            <Input v-model="selectedSsh.ssh_agent_sock_path" class="col-span-3" :placeholder="t('connection.sshAgentSockPathPlaceholder')" />
+          </div>
+          <div v-if="selectedSsh.auth_method === 'agent'" class="grid grid-cols-4 items-center gap-4">
+            <Label class="text-xs">{{ t("connection.sshAgentKey") }}</Label>
+            <div class="col-span-3 flex min-w-0 items-center gap-1">
+              <div class="min-w-0 flex-1">
+                <Select :model-value="selectedSsh.ssh_agent_key_fingerprint || SSH_AGENT_ALL_IDENTITIES" @update:model-value="updateSelectedSshAgentKeyFingerprint">
+                  <SelectTrigger class="h-9 w-full min-w-0">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem :value="SSH_AGENT_ALL_IDENTITIES">{{ t("connection.sshAgentKeyAll") }}</SelectItem>
+                    <SelectItem v-for="identity in sshAgentIdentityOptions" :key="identity.fingerprint" :value="identity.fingerprint" :title="identity.fingerprint">
+                      {{ sshAgentIdentityLabel(identity) }}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" :title="t('connection.sshAgentKeyRefresh')" :disabled="sshAgentIdentitiesLoading" @click="loadSshAgentIdentities(selectedSsh.ssh_agent_sock_path || '')">
+                <Loader2 v-if="sshAgentIdentitiesLoading" class="h-4 w-4 animate-spin" />
+                <RefreshCw v-else class="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+          <div v-if="selectedSsh.auth_method === 'agent'" class="grid grid-cols-4 items-start gap-4">
+            <span />
+            <div class="col-span-3 text-xs text-muted-foreground">
+              <p>{{ t("connection.sshAgentKeyHint") }}</p>
+              <p v-if="sshAgentIdentitiesError" class="mt-1">{{ sshAgentIdentitiesError }}</p>
+            </div>
+          </div>
+          <div class="grid grid-cols-4 items-center gap-4">
+            <span />
+            <label class="col-span-3 flex cursor-pointer items-center gap-2">
+              <input v-model="selectedSsh.expose_lan" type="checkbox" class="mr-0" />
+              <span class="text-xs text-muted-foreground">{{ t("connection.sshExposeLan") }}</span>
+            </label>
+          </div>
+        </template>
         <div class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("connection.sshConnectTimeout") }}</Label>
           <Input v-model.number="selectedSsh.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" />
@@ -487,7 +491,7 @@ async function testSelected() {
       <Button type="button" variant="outline" size="sm" :disabled="!isDirty || isSaving" @click="resetDraft">
         {{ t("settings.tunnelsReset") }}
       </Button>
-      <Button v-if="selectedSsh || selectedProxy" type="button" variant="outline" size="sm" :disabled="isTesting || isSaving || (!selectedSsh?.host?.trim() && !selectedProxy?.host?.trim())" @click="testSelected">
+      <Button v-if="selectedSsh || selectedProxy" type="button" variant="outline" size="sm" :disabled="isTesting || isSaving || (!selectedSsh?.cf && !selectedSsh?.host?.trim() && !selectedProxy?.host?.trim())" @click="testSelected">
         <Loader2 v-if="isTesting" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
         {{ isTesting ? t("settings.tunnelsTesting") : t("settings.tunnelsTest") }}
       </Button>

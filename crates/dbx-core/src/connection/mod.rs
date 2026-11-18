@@ -4331,7 +4331,13 @@ impl AppState {
         config: &ConnectionConfig,
     ) -> Result<Vec<TransportLayerConfig>, String> {
         let layers = config.effective_transport_layers();
-        self.resolve_transport_profile_layers(layers).await
+        let layers = self.resolve_transport_profile_layers(layers).await?;
+        if config.db_type != DatabaseType::SapHana
+            && layers.iter().any(|layer| matches!(layer, TransportLayerConfig::Ssh(ssh) if ssh.cf.is_some()))
+        {
+            return Err("Cloud Foundry SSH is only supported for SAP HANA connections".into());
+        }
+        Ok(layers)
     }
 
     async fn resolve_transport_profile_layers(
@@ -4388,6 +4394,16 @@ impl AppState {
     pub async fn test_tunnel_profile(&self, profile: &TransportLayerConfig) -> Result<String, String> {
         match profile {
             TransportLayerConfig::Ssh(ssh) => {
+                if let Some(cf) = &ssh.cf {
+                    ResolvedTransportLayers::resolve(&[profile.clone()])?;
+                    let probe_id = format!("__tunnel_profile_test__:{}", uuid::Uuid::new_v4());
+                    let result = self
+                        .tunnels
+                        .start_cf_tunnel(&probe_id, cf, "127.0.0.1", 1, None, ssh.connect_timeout_secs.max(30))
+                        .await;
+                    self.tunnels.stop_tunnel(&probe_id).await;
+                    return result.map(|_| "Cloud Foundry SSH connection successful".into());
+                }
                 // A `~/.ssh/config` alias declaring `ProxyJump` resolves to more
                 // than one hop; every other alias (the common case) resolves to
                 // exactly one, matching `resolve_ssh_tunnel_config`.
@@ -4581,6 +4597,11 @@ impl AppState {
             claimant.bind_profile_sources(self, source_profile_ids.clone())?;
         }
         let transport_layers = self.resolve_transport_profile_layers(layers).await?;
+        if transport_layers.iter().any(|layer| matches!(layer, TransportLayerConfig::Ssh(ssh) if ssh.cf.is_some()))
+            && config.db_type != DatabaseType::SapHana
+        {
+            return Err("Cloud Foundry SSH is only supported for SAP HANA connections".into());
+        }
         self.ensure_ssh_local_port_supported(config, &transport_layers)?;
         let transport_summary = transport_layers
             .iter()
@@ -10369,6 +10390,25 @@ mod tests {
         assert_eq!(params["connection_string"], "jdbc:sap://hana.example.com:30013/?databaseName=TENANT1&encrypt=true");
     }
 
+    #[tokio::test]
+    async fn cf_ssh_transport_is_hana_only_without_starting_cli() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.transport_layers = vec![serde_json::from_value(serde_json::json!({
+            "type": "ssh", "id": "cf", "cf": {
+                "api_endpoint": "https://api.cf.example.com", "org": "team",
+                "space": "dev", "app": "proxy", "instance_index": 0
+            }
+        }))
+        .unwrap()];
+        assert!(state.resolved_transport_layers(&config).await.unwrap_err().contains("only supported for SAP HANA"));
+        config.db_type = DatabaseType::SapHana;
+        let layers = state.resolved_transport_layers(&config).await.unwrap();
+        assert!(matches!(&layers[0], TransportLayerConfig::Ssh(ssh) if ssh.cf.is_some()));
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     pub(super) async fn test_app_state() -> (AppState, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("dbx-core-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -11701,6 +11741,7 @@ mod tests {
             auth_method: "password".to_string(),
             allow_exec_channel_proxy: false,
             proxy_command: String::new(),
+            cf: None,
             profile_id: String::new(),
         });
         assert!(state.test_tunnel_profile(&ssh).await.is_err());
@@ -15458,6 +15499,7 @@ for line in sys.stdin:
             auth_method: String::new(),
             allow_exec_channel_proxy: false,
             proxy_command: String::new(),
+            cf: None,
             profile_id: profile_id.to_string(),
         }
     }

@@ -307,6 +307,23 @@ async fn start_transport_layers_internal(
 
         let local_port =
             match (layer, &ssh_chains[index]) {
+                (TransportLayerConfig::Ssh(ssh), _) if ssh.cf.is_some() => {
+                    if final_ssh_socks5 {
+                        return Err(
+                            "Cloud Foundry SSH supports static SAP HANA forwarding, not dynamic SOCKS5 routing".into(),
+                        );
+                    }
+                    ssh_tunnels
+                        .start_cf_tunnel(
+                            &layer_id,
+                            ssh.cf.as_ref().expect("CF configuration checked"),
+                            &target_endpoint.host,
+                            target_endpoint.port,
+                            if is_last { final_ssh_local_port } else { None },
+                            effective_ssh_connect_timeout_secs(ssh.connect_timeout_secs),
+                        )
+                        .await?
+                }
                 (TransportLayerConfig::Ssh(_), Some(chain)) if chain.len() > 1 => {
                     if is_last && final_ssh_socks5 {
                         return Err("Dynamic SOCKS5 routing does not support a multi-hop SSH (ProxyJump) profile yet."
@@ -426,6 +443,17 @@ pub async fn stop_transport_layers(
 }
 
 fn validate_transport_layers(layers: &[TransportLayerConfig]) -> Result<(), String> {
+    if layers.iter().any(|layer| matches!(layer, TransportLayerConfig::Ssh(ssh) if ssh.cf.is_some())) {
+        if layers.len() != 1 {
+            return Err("Cloud Foundry SSH must be the only transport layer".into());
+        }
+        if let TransportLayerConfig::Ssh(ssh) = &layers[0] {
+            super::cf_ssh::validate_config(ssh.cf.as_ref().expect("CF configuration checked"))?;
+            if ssh.expose_lan {
+                return Err("Cloud Foundry SSH is scoped to DBX and cannot expose its forward to the LAN".into());
+            }
+        }
+    }
     for (index, layer) in layers.iter().enumerate() {
         if matches!(layer, TransportLayerConfig::HttpTunnel(_)) && index != 0 {
             return Err("HTTP tunnel must be the first transport layer".to_string());
@@ -557,7 +585,31 @@ mod tests {
             auth_method: "password".to_string(),
             allow_exec_channel_proxy: false,
             proxy_command: String::new(),
+            cf: None,
         })
+    }
+
+    #[test]
+    fn cf_ssh_rejects_chains_and_lan_exposure_without_starting_cli() {
+        let mut layer = ssh_layer("cf", "", 22);
+        if let TransportLayerConfig::Ssh(ssh) = &mut layer {
+            ssh.cf = Some(crate::models::connection::CfSshConfig {
+                api_endpoint: "https://api.cf.example.com".into(),
+                org: "team".into(),
+                space: "dev".into(),
+                app: "proxy".into(),
+                instance_index: 0,
+            });
+        }
+        assert!(ResolvedTransportLayers::resolve(&[layer.clone()]).is_ok());
+        assert!(ResolvedTransportLayers::resolve(&[layer.clone(), ssh_layer("other", "bastion", 22)])
+            .err()
+            .unwrap()
+            .contains("only transport layer"));
+        if let TransportLayerConfig::Ssh(ssh) = &mut layer {
+            ssh.expose_lan = true;
+        }
+        assert!(ResolvedTransportLayers::resolve(&[layer]).err().unwrap().contains("LAN"));
     }
 
     fn proxy_layer(id: &str, host: &str, port: u16) -> TransportLayerConfig {

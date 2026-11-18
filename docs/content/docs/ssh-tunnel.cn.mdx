@@ -102,6 +102,21 @@ DBX 会在发送凭据前验证 SSH 主机密钥。已知密钥从系统 `known_
 
 <Callout type="warn">启用“允许局域网访问”后，固定端口会监听 `0.0.0.0`，任何能通过该端口访问到你这台机器的设备都可以使用这条隧道。只应在可信网络并配合防火墙使用。</Callout>
 
+## SAP HANA 的 Cloud Foundry SSH 连接
+
+如果 Cloud Foundry 应用能访问 HANA，可以在连接的 **隧道/代理** 页签中选择 **SSH → SSH 提供方 → Cloud Foundry (SSO)**。也可以在 **设置 → 隧道** 中创建 Cloud Foundry SSH 共享配置，再由 HANA 连接引用。
+
+1. 在运行 DBX 后端的电脑或服务器上安装 Cloud Foundry CLI（`cf`）。
+2. **数据库主机** 仍填写真实的 HANA 主机名和远程端口（HANA Cloud 通常为 `443`），正常配置 HANA 用户、密码和 TLS 参数，例如连接参数中的 `encrypt=true`。
+3. 填写 HTTPS **CF API 地址**、**组织**、**空间**、**代理应用** 和 **应用实例索引**（默认 `0`）。应用必须处于运行状态，应用和空间必须允许 SSH，且应用能够访问 HANA。
+4. 点击 **测试** 或连接。需要认证时，DBX 显示 SSO 验证码地址。点击 **打开 SSO 登录**，在浏览器中完成登录，再把一次性验证码粘贴到 DBX。
+
+DBX 自动管理相当于 `cf login --sso` 和 `cf ssh APP -N -i INDEX -L 127.0.0.1:LOCAL_PORT:HANA_HOST:HANA_PORT` 的流程。登录和目标选择使用独立的运行时 `CF_HOME`，不会修改终端的 CF 会话。验证码通过标准输入发送给 CLI，不进入命令行参数或保存的连接配置。API TLS 校验和 CF SSH 主机校验保持启用。
+
+HANA 驱动连接临时的本机回环端点。若未显式配置，DBX 会通过 HANA 的 `sslHostNameInCertificate` 和 `sslSNIHostname` 参数保留原始主机名，以维护证书校验和 SNI，而不修改系统 hosts 文件或全局 DNS。断开连接时关闭转发并释放本地端口。后端运行期间复用有效的 CF 会话，认证过期后重新提示 SSO 登录；后端正常退出时删除私有 CF 会话文件。
+
+<Callout type="info">目前仅支持 SAP HANA，且 Cloud Foundry SSH 必须是唯一启用的传输层，不支持局域网访问或动态 SOCKS5 转发。独立 SSH 测试仅验证 CF SSH 权限，HANA 的实际可达性请使用数据库连接测试验证。</Callout>
+
 ## 代理
 
 如果当前网络要求通过代理访问数据库，可以添加代理层，而不是配置 SSH。

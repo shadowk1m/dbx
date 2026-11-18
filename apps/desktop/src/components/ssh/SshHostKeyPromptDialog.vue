@@ -80,6 +80,27 @@ const dialogDescription = computed(() => {
   return t(messageKey.value, { host: current.value?.host ?? "", port: current.value?.port ?? "" });
 });
 const promptBody = computed(() => (isPluginInputPrompt.value ? current.value?.prompt?.trim() || t("connection.sshInteractiveDefaultPrompt") : ""));
+const cfPasscodeUrl = computed(() => {
+  if (current.value?.source !== "Cloud Foundry") return "";
+  const lines = promptBody.value.split("\n");
+  const candidate = lines[lines.length - 1] || "";
+  try {
+    const url = new URL(candidate);
+    return url.protocol === "https:" && !url.username && !url.password && url.pathname === "/passcode" ? url.href : "";
+  } catch {
+    return "";
+  }
+});
+
+async function openCfPasscodeUrl() {
+  if (!cfPasscodeUrl.value) return;
+  if (isTauriRuntime()) {
+    const { open } = await import("@tauri-apps/plugin-shell");
+    await open(cfPasscodeUrl.value);
+  } else {
+    window.open(cfPasscodeUrl.value, "_blank", "noopener,noreferrer");
+  }
+}
 const visible = ref(false);
 
 const remember = ref(true);
@@ -370,6 +391,7 @@ watch(
 
         <div v-else-if="isPluginInputPrompt" class="space-y-3">
           <p class="whitespace-pre-wrap text-sm text-muted-foreground">{{ promptBody }}</p>
+          <Button v-if="cfPasscodeUrl" variant="outline" :disabled="resolving" @click="openCfPasscodeUrl">{{ t("connection.cfSshOpenLogin") }}</Button>
           <div v-if="promptOptions.length" class="flex flex-col gap-2">
             <Button v-for="option in promptOptions" :key="option.value" variant="outline" class="h-auto w-full justify-start py-2 text-left whitespace-normal" :disabled="resolving" @click="submitOption(option.value)">
               {{ option.label }}

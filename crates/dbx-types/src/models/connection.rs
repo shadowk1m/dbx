@@ -474,7 +474,21 @@ impl TransportLayerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CfSshConfig {
+    pub api_endpoint: String,
+    pub org: String,
+    pub space: String,
+    pub app: String,
+    #[serde(default)]
+    pub instance_index: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SshTunnelConfig {
+    /// Cloud Foundry SSO + app SSH forwarding instead of a standalone SSH host.
+    /// Credentials are managed in a private runtime CF_HOME, never in this config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cf: Option<CfSshConfig>,
     #[serde(default)]
     pub id: String,
     #[serde(default)]

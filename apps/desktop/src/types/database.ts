@@ -310,7 +310,17 @@ export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type
  */
 export type TunnelProfile = TransportLayerConfig;
 
+export interface CfSshConfig {
+  api_endpoint: string;
+  org: string;
+  space: string;
+  app: string;
+  instance_index: number;
+}
+
 export interface SshTunnelConfig {
+  /** CF SSO session and app forwarding; no tokens or passcodes are saved. */
+  cf?: CfSshConfig;
   id: string;
   name?: string;
   enabled?: boolean;

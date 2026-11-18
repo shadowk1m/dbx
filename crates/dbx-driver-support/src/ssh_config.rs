@@ -68,6 +68,9 @@ pub fn find_host(alias: &str) -> Option<SshConfigHostEntry> {
 /// first existing default key, the way OpenSSH does. Without this the tunnel
 /// builder rejects the empty path with "File path cannot be empty" (#11839).
 pub fn resolve_ssh_tunnel_config(ssh: &SshTunnelConfig) -> SshTunnelConfig {
+    if ssh.cf.is_some() {
+        return ssh.clone();
+    }
     let resolved = match find_host(&ssh.host) {
         Some(entry) => apply_host_entry(ssh, entry),
         None => ssh.clone(),
@@ -119,6 +122,9 @@ fn apply_default_identity_file_with(mut ssh: SshTunnelConfig, exists: impl Fn(&s
 /// so each one inherits `ssh`'s password/key/agent settings; only the
 /// host/port/user/identity file come from its own `~/.ssh/config` entry.
 pub fn resolve_ssh_tunnel_chain(ssh: &SshTunnelConfig) -> Vec<SshTunnelConfig> {
+    if ssh.cf.is_some() {
+        return vec![ssh.clone()];
+    }
     resolve_chain_from_entries(ssh, &list_hosts().unwrap_or_default())
 }
 
@@ -170,6 +176,7 @@ fn jump_hop_from_entry(leaf: &SshTunnelConfig, entry: SshConfigHostEntry) -> Ssh
     };
     SshTunnelConfig {
         id: format!("{}::proxyjump::{}", leaf.id, entry.alias),
+        cf: None,
         name: entry.alias.clone(),
         enabled: true,
         host: entry.host_name.unwrap_or_else(|| entry.alias.clone()),
@@ -587,6 +594,7 @@ mod tests {
             auth_method: String::new(),
             allow_exec_channel_proxy: false,
             proxy_command: String::new(),
+            cf: None,
         }
     }
 

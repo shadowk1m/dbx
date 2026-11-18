@@ -1,5 +1,6 @@
 pub use dbx_driver_agent::agent_driver;
 pub mod clickhouse_driver;
+pub mod cf_ssh;
 pub mod cloudberry;
 pub mod cloudflare_d1;
 pub use cloudflare_d1 as cloudflare_d1_driver;

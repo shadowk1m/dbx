@@ -102,6 +102,21 @@ By default, DBX picks a random free local port for the SSH tunnel. Set **Local P
 
 <Callout type="warn">With **Expose tunnel to LAN** on, the fixed port listens on `0.0.0.0`, so any device that can reach your machine on that port can use the tunnel. Use it only on trusted networks with appropriate firewall rules.</Callout>
 
+## Cloud Foundry SSH for SAP HANA
+
+For a HANA database reachable from a Cloud Foundry application, choose **SSH → SSH provider → Cloud Foundry (SSO)** in the connection's **Tunnel / Proxy** tab. You can also create a Cloud Foundry SSH profile in **Settings → Tunnels** and reference it from HANA connections.
+
+1. Install the Cloud Foundry CLI (`cf`) on the machine running the DBX backend.
+2. Keep the **database host** set to the real HANA hostname and enter its remote port (for HANA Cloud, usually `443`). Keep your HANA credentials and TLS settings configured normally, for example `encrypt=true` in connection parameters.
+3. Enter the HTTPS **CF API endpoint**, **Organization**, **Space**, **Proxy application**, and **App instance index** (default `0`). The app must be running, SSH must be enabled for the app and space, and the app must be able to reach HANA.
+4. Click **Test** or connect. When authentication is needed, DBX displays the SSO passcode URL. Click **Open SSO login**, sign in in your browser, and paste the one-time passcode into DBX.
+
+DBX manages the equivalent of `cf login --sso` and `cf ssh APP -N -i INDEX -L 127.0.0.1:LOCAL_PORT:HANA_HOST:HANA_PORT`. CF login and targeting use a private runtime `CF_HOME`; your terminal's CF session is unchanged. Passcodes are sent to the CLI through standard input, not command-line arguments or saved connection settings. API TLS verification and CF SSH host validation remain enabled.
+
+The HANA driver dials the temporary loopback endpoint. DBX supplies the original hostname through HANA's `sslHostNameInCertificate` and `sslSNIHostname` properties unless you explicitly configured them. This preserves certificate verification and SNI without modifying the system hosts file or global DNS. The forward is stopped and its local port released on disconnect. Valid CF sessions are reused within the running backend; expired sessions prompt for SSO again, and private CF session files are removed on normal backend shutdown.
+
+<Callout type="info">Cloud Foundry SSH is currently limited to SAP HANA and must be the connection's only enabled transport layer. LAN exposure and dynamic SOCKS5 routing are not supported. Use the database connection test to verify HANA access; the standalone SSH test verifies only CF SSH access.</Callout>
+
 ## Proxy
 
 Use a proxy layer when your environment requires an outbound proxy instead of SSH.

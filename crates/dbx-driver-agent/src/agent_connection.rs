@@ -649,6 +649,20 @@ fn sap_hana_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: 
         query_parts.push(params.to_string());
     }
 
+    // Connection-scoped routing: keep HANA's identity and SNI hostname while
+    // the TCP connection dials the local tunnel. No process-wide DNS or hosts
+    // file changes, and no certificate-validation bypass.
+    if host == "127.0.0.1" && host != config.host {
+        for property in ["sslHostNameInCertificate", "sslSNIHostname"] {
+            let already_set = params
+                .split(['&', ';'])
+                .any(|part| part.split_once('=').is_some_and(|(key, _)| key.eq_ignore_ascii_case(property)));
+            if !already_set {
+                query_parts.push(format!("{property}={}", utf8_percent_encode(&config.host, NON_ALPHANUMERIC)));
+            }
+        }
+    }
+
     if query_parts.is_empty() {
         format!("jdbc:sap://{host}:{port}")
     } else {
@@ -1560,6 +1574,39 @@ mod tests {
         let params = agent_connect_params(&cfg, "hana.example.com", 30013, "TENANT1").unwrap();
 
         assert_eq!(params["connection_string"], "jdbc:sap://hana.example.com:30013/?databaseName=TENANT1&encrypt=true");
+    }
+
+    #[test]
+    fn sap_hana_tunnel_preserves_tls_identity_and_sni_without_dns_mutation() {
+        let mut cfg = config(DatabaseType::SapHana, Some("TENANT1"));
+        cfg.host = "hana.example.com".into();
+        cfg.url_params = Some("encrypt=true".into());
+        let original = cfg.clone();
+        let params = agent_connect_params(&cfg, "127.0.0.1", 43123, "TENANT1").unwrap();
+        let url = params["connection_string"].as_str().unwrap();
+        assert!(url.starts_with("jdbc:sap://127.0.0.1:43123/"));
+        assert!(url.contains("sslHostNameInCertificate=hana%2Eexample%2Ecom"));
+        assert!(url.contains("sslSNIHostname=hana%2Eexample%2Ecom"));
+        assert!(url.contains("encrypt=true"));
+        assert!(!url.contains("sslValidateCertificate=false"));
+        assert_eq!(cfg.host, original.host);
+        assert_eq!(cfg.url_params, original.url_params);
+        let direct = agent_connect_params(&cfg, &cfg.host, cfg.port, "TENANT1").unwrap();
+        assert!(!direct["connection_string"].as_str().unwrap().contains("sslSNIHostname"));
+    }
+
+    #[test]
+    fn sap_hana_tunnel_keeps_explicit_certificate_and_sni_names() {
+        let mut cfg = config(DatabaseType::SapHana, None);
+        cfg.host = "hana.example.com".into();
+        cfg.url_params =
+            Some("encrypt=true&sslHostNameInCertificate=cert.example.com&sslSNIHostname=sni.example.com".into());
+        let params = agent_connect_params(&cfg, "127.0.0.1", 43123, "").unwrap();
+        let url = params["connection_string"].as_str().unwrap();
+        assert_eq!(url.matches("sslHostNameInCertificate=").count(), 1);
+        assert_eq!(url.matches("sslSNIHostname=").count(), 1);
+        assert!(url.contains("cert.example.com"));
+        assert!(url.contains("sni.example.com"));
     }
 
     #[test]
