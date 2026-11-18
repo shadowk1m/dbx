@@ -54,8 +54,10 @@ import {
   Bot,
   Camera,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Clock,
   Hourglass,
   CircleSlash,
@@ -79,6 +81,7 @@ import {
   Server,
   ShieldCheck,
   Table2,
+  Target,
   Play,
   Square,
   Sparkles,
@@ -144,6 +147,7 @@ import {
   type CustomPromptContext,
 } from "@/lib/ai/ai";
 import { activeAiRunBinding, aiContextTargetFor, bindingForSnapshot, resolveConversationBinding, resolveExternalSendTarget, sameConversationBinding, type AiConversationBinding } from "@/lib/ai/aiConversationBinding";
+import { resolveComposerDatabaseReset, toggleSelectedDatabase, withDatabaseSelected, type AiComposerScope } from "@/lib/ai/aiComposerDatabases";
 import type { AiExternalContextRequest } from "@/lib/ai/aiExternalContext";
 import {
   AI_IMAGE_ATTACHMENT_MAX_BYTES,
@@ -173,7 +177,7 @@ import { isAiConfigModelCandidate, isCliProvider } from "@/lib/ai/aiConfigCandid
 import { deleteConversationWithCancellation, stopAiGenerationWithFallback } from "@/lib/ai/aiConversationLifecycle";
 import { AiGenerationGuard } from "@/lib/ai/aiGenerationGuard";
 import { applyStatusEvent, createGenerationStatus, createStatusTicker, liveAnnouncementText, markCancelling, shouldShowLongRunningHint, statusText, toolLabel, STATUS_IDLE_THRESHOLD_MS, type AiGenerationStatus } from "@/lib/ai/aiGenerationStatus";
-import { supportsBackgroundAiRuns } from "@/lib/ai/aiRuntimeStrategy";
+import { resolveAiRuntimeStrategy, supportsBackgroundAiRuns } from "@/lib/ai/aiRuntimeStrategy";
 import {
   acquireDesktopAiRunSlot,
   activeDesktopAiRuns,
@@ -192,7 +196,7 @@ import {
 } from "@/lib/ai/desktopAiRunRegistry";
 import { createDesktopAiRunSnapshotScheduler } from "@/lib/ai/desktopAiRunSnapshotScheduler";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
-import { addConfiguredAiModel, aiModelOptions } from "@/lib/ai/aiConfigList";
+import { addConfiguredAiModel, aiModelOptions, removeConfiguredAiModel } from "@/lib/ai/aiConfigList";
 import { orderAiConfigsForDisplay } from "@/lib/ai/aiConfigOrdering";
 import { effortSelectionEquals, runtimeEffortFromPreference } from "@/lib/ai/aiEffortPreference";
 import { useAiModelCatalog } from "@/composables/useAiModelCatalog";
@@ -203,6 +207,7 @@ import { databaseManifestEntry } from "@/lib/database/databaseDriverManifest";
 import type { AgentEvent } from "@/lib/backend/tauri";
 import { buildAiAgentPlan } from "@/lib/ai/aiAgentPlan";
 import { extractFirstSqlCodeBlock, extractSingleSqlCodeBlock } from "@/lib/ai/aiSqlExecutionPolicy";
+import type { AiSqlActionReport } from "@/lib/ai/aiSqlActionFeedback";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import ProductionContextBadge from "@/components/common/ProductionContextBadge.vue";
 import { buildAiAgentStepItems, formatAgentToolName, formatToolDurationMs, toolCallStepKey, updateAgentStepApproval, upsertAgentStep, type AiAgentStepItem, type AiAgentStepTone } from "@/lib/ai/aiAgentStepPresentation";
@@ -250,6 +255,8 @@ import { buildAiConversationSearchIndex, filterAiConversationSearchIndex } from 
 import { applyCapabilities, resolveConversationPicker, resolveDefaultPickerAction, type AiPickerAmbient, type AiPickerConversationRecord, type AiPickerSelection } from "@/lib/ai/aiConversationPicker";
 import { createAiConversationPickerController } from "@/lib/ai/aiConversationPickerState";
 import AiAttachmentCard from "@/components/editor/AiAttachmentCard.vue";
+import { cancelSessionToolApprovals } from "@/lib/ai/aiAgentStepPresentation";
+import { useAiToolApprovalDock } from "@/composables/useAiToolApprovalDock";
 import AiToolApprovalCard from "@/components/editor/AiToolApprovalCard.vue";
 import { resolveAiMessageCopyText } from "@/lib/ai/aiMessageCopy";
 import { buildPluginAiRequest, createPluginAiConversation, pluginComposerConnectionLabel, pluginContextConnectionId, pluginContextFromMessages, pluginContextText, streamPluginAiConversation, type AiPluginContext, type AiPluginConversationRequest } from "@/lib/ai/aiPluginConversation";
@@ -292,7 +299,8 @@ const { openTableTarget } = useNavigationTargets({
 const { toast } = useToast();
 const { isDark } = useTheme();
 const supportsCliProviders = isTauriRuntime();
-const backgroundAiRunsEnabled = supportsBackgroundAiRuns();
+const aiRuntimeStrategy = resolveAiRuntimeStrategy();
+const backgroundAiRunsEnabled = supportsBackgroundAiRuns(aiRuntimeStrategy);
 
 type AiMessageMention =
   | {
@@ -361,7 +369,7 @@ interface ChatMessage {
    *  `writeSqlConfirmation` / `productionWriteBlocked` mark backend-generated,
    *  localized confirmation/block messages so the UI does not re-detect them
    *  from text phrasing. */
-  kind?: "contextSummary" | "writeSqlConfirmation" | "productionWriteBlocked";
+  kind?: "contextSummary" | "writeSqlConfirmation" | "productionWriteBlocked" | "outputTruncated";
   /** Per-message token stats from the last agent run; ephemeral, not persisted. */
   tokens?: { input: number; output: number };
   /**
@@ -393,9 +401,9 @@ const props = defineProps<{
 // active tab, so AI-generated SQL could be written into, and executed on,
 // another connection's editor.
 const emit = defineEmits<{
-  appendSql: [sql: string, target: AiConversationBinding];
-  executeSql: [sql: string, target: AiConversationBinding];
-  tempRunSql: [sql: string, target: AiConversationBinding];
+  appendSql: [sql: string, target: AiConversationBinding, requestId?: number];
+  executeSql: [sql: string, target: AiConversationBinding, requestId?: number];
+  tempRunSql: [sql: string, target: AiConversationBinding, requestId?: number];
   requestAutoExecuteSql: [sql: string, target: AiConversationBinding];
   insertRedisCommand: [command: string, target: AiConversationBinding];
   executeRedisCommand: [command: string, target: AiConversationBinding];
@@ -678,7 +686,9 @@ const aiContextTarget = computed<AiContextTarget>(() => aiContextTargetFor(conve
 function restoreInitialConversation() {
   if (!assistantViewMounted || initialConversationRestored || !initialConversationStateLoaded || !settings.isAiConfigLoaded) return;
   initialConversationRestored = true;
-  if (settings.restoreLastConversation && conversations.value[0]) {
+  // A new detached editor starts its own chat instead of implicitly adopting
+  // a conversation that may still be running in the main window.
+  if (aiRuntimeStrategy !== "desktop-cancel-on-close" && settings.restoreLastConversation && conversations.value[0]) {
     selectConversation(conversations.value[0]);
   }
 }
@@ -1042,6 +1052,17 @@ watch([skillStateKey, () => selectedSkillChips.value.map((chip) => chip.id).join
   conversationSkillHintSeen.add(key);
   skillHintLatch.value = { key, id: chips[0].id, name: chips[0].name };
 });
+const selectedSkillsCollapsed = ref(false);
+const loadedSelectedSkillsCount = computed(() => selectedSkillChips.value.filter((chip) => chip.loaded).length);
+
+watch(
+  () => selectedSkillChips.value.length,
+  (len) => {
+    if (len === 0) {
+      selectedSkillsCollapsed.value = false;
+    }
+  },
+);
 // Minting the unsaved chat's id on its first send (or when queueing) is not a
 // conversation switch: move the unsaved chat's skill state onto the id it just
 // adopted, or the brand-new id would read as a fresh conversation (Req 14) and
@@ -1543,6 +1564,9 @@ function submitEdit(visibleIndex: number) {
   }
   draftPluginContext.value = pluginContext.value;
   messages.value = messages.value.slice(0, actualIndex);
+  // The truncated tail carried the positional SQL-block statuses of the messages
+  // that just disappeared; the regenerated message reuses those indices.
+  clearSqlActionBlockStatuses();
   editingMessageIndex.value = null;
   editingContent.value = "";
   selectedMentions.value = editingMentions.value.filter((mention): mention is AiTableMention & { kind: "table" } => mention.kind === "table").map(({ raw, schema, table }) => ({ raw, schema, table }));
@@ -1729,12 +1753,47 @@ async function applyManualModel(configId: string) {
   const config = settings.aiConfigs.find((item) => item.id === configId);
   if (!config) return;
   try {
-    if (config.model.trim() !== modelId) {
-      await settings.updateAiConfigItem(configId, { models: addConfiguredAiModel(config.models, modelId) });
-    }
+    await settings.updateAiConfigItem(configId, { models: addConfiguredAiModel(config.models, modelId) });
     handleModelSelect(configId, modelId);
     manualModelConfigId.value = "";
     manualModelId.value = "";
+  } catch (error) {
+    toast(translateBackendError(t, error));
+  }
+}
+
+function canRemoveModel(config: AiConfigItem, modelId: string): boolean {
+  if (isCliProvider(config.provider) && modelId === "default") return false;
+  const isDiscovered = (modelCatalogs.get(config.id)?.models ?? []).some((m) => m.id === modelId);
+  if (isDiscovered) return false;
+  const preset = getAiProviderPreset(config.provider, config.endpoint);
+  if (preset.group === "partner" && (preset.models ?? []).some((m) => m.name.trim() === modelId)) {
+    return false;
+  }
+  return (config.models ?? []).some((m) => m.name.trim() === modelId);
+}
+
+async function handleRemoveModel(configId: string, modelId: string) {
+  const config = settings.aiConfigs.find((item) => item.id === configId);
+  if (!config) return;
+  const nextModels = removeConfiguredAiModel(config.models, modelId);
+  const updates: Partial<AiConfigItem> = { models: nextModels };
+  if (config.model.trim() === modelId) {
+    updates.model = isCliProvider(config.provider) ? "default" : (nextModels[0]?.name ?? "");
+  }
+  try {
+    await settings.updateAiConfigItem(configId, updates);
+    if (settings.activeModel?.configId === configId && settings.activeModel?.modelId === modelId) {
+      const remaining = aiModelOptions({ ...config, ...updates }, modelCatalogs.get(configId)?.models ?? []);
+      const nextActiveModelId = remaining[0]?.id;
+      if (nextActiveModelId) {
+        handleModelSelect(configId, nextActiveModelId);
+      } else {
+        settings.updateActiveModel(null);
+      }
+    }
+    effortCatalogs.delete(effortKey(configId, modelId));
+    closeEffortMenu();
   } catch (error) {
     toast(translateBackendError(t, error));
   }
@@ -2093,8 +2152,33 @@ async function resolveAutoAction(text: string, mode: AiAssistantMode, showProgre
 
 /** Messages visible in the chat UI (excludes hidden context summaries). */
 const visibleMessages = computed(() => messages.value.filter((m) => m.kind !== "contextSummary"));
+const pendingApprovalSteps = useAiToolApprovalDock(() => visibleMessages.value);
+const truncatedReply = computed(() => {
+  const last = visibleMessages.value[visibleMessages.value.length - 1];
+  return last?.role === "assistant" && last.kind === "outputTruncated" && !last.failed ? last : null;
+});
+
+function continueTruncatedReply(message: ChatMessage) {
+  if (message !== truncatedReply.value || isGenerating.value || isAttachmentProcessing.value || currentQueuedInput.value || !activeFullConfig.value) return;
+  clearPendingWriteGrant();
+  // Reuse the normal send lifecycle, while keeping the composer's unsent draft
+  // and attachments out of this follow-up. The reply retains its original target.
+  pendingAutoSends.push({
+    conversationId: conversationId.value,
+    text: t("ai.continueGenerationPrompt"),
+    messages: messages.value,
+    mode: "ask",
+    action: "general",
+    pluginContext: pluginContext.value,
+    binding: message.sourceBinding ?? conversationBinding.value,
+  });
+  void send();
+}
 
 function messagesForAgentHistory(historyMessages: ChatMessage[]): AiMessage[] {
+  // Some reasoning models spend the entire budget before emitting visible text.
+  // Replaying an empty assistant turn is rejected by several provider APIs.
+  historyMessages = historyMessages.filter((message) => message.role !== "assistant" || message.kind !== "outputTruncated" || !!message.content);
   const toModelMessage = (message: ChatMessage): AiMessage => ({
     role: message.role,
     content: messageContentForModel(message),
@@ -2208,7 +2292,7 @@ const proposalConfirmMessage = computed<ChatMessage | null>(() => {
     const msg = messages.value[i];
     if (msg.kind === "contextSummary") continue;
     if (msg.role !== "assistant") return null;
-    if (!msg.content) return null;
+    if (!msg.content || msg.kind === "outputTruncated") return null;
     // Backend-generated write confirmations are localized, so the English/Chinese
     // phrase detectors cannot recognize them; the `kind` marker plus one exact
     // SQL block is the structural proof of actionability.
@@ -2418,44 +2502,92 @@ function syncSelectedDatabases() {
   const active = selectedNamespace.value;
   const available = dbSelectOptions.value.map((option) => option.database);
   const retained = selectedDatabases.value.filter((database) => available.includes(database));
-  const next = retained.length ? retained : active ? [active] : [];
+  // The target is always part of the scope: the run executes on it even when the
+  // options list has not loaded yet, and @ mentions resolve against the selection
+  // (#12972).
+  const next = withDatabaseSelected(retained.length ? retained : active ? [active] : [], active);
   removeMentionsOfDatabases(selectedDatabases.value.filter((database) => !next.includes(database)));
   selectedDatabases.value = next;
 }
 
 function toggleDatabase(database: string) {
-  if (selectedDatabaseValues.value.has(database)) {
-    if (selectedDatabases.value.length === 1) return;
-    selectedDatabases.value = selectedDatabases.value.filter((item) => item !== database);
-    removeMentionsOfDatabases([database]);
-  } else {
-    selectedDatabases.value = [...selectedDatabases.value, database];
+  // Extra selected databases are read-only context. The target is set through
+  // `setDatabaseTarget` instead, so unchecking cannot silently move SQL elsewhere.
+  const next = toggleSelectedDatabase(selectedDatabases.value, database, selectedNamespace.value);
+  if (!next) return;
+  removeMentionsOfDatabases(selectedDatabases.value.filter((database) => !next.includes(database)));
+  selectedDatabases.value = next;
+}
+
+/** Drop the extra context databases. The target itself is never deselectable (#12972). */
+function clearDatabaseSelection() {
+  const next = selectedNamespace.value ? [selectedNamespace.value] : [];
+  removeMentionsOfDatabases(selectedDatabases.value.filter((database) => !next.includes(database)));
+  selectedDatabases.value = next;
+}
+
+/** Whether `database` is the namespace this chat executes on. */
+function isTargetNamespace(database: string): boolean {
+  return !!database && database === selectedNamespace.value;
+}
+
+/**
+ * Make `database` the database this chat executes on (#12972).
+ *
+ * The conversation binding is the single execution target (SQL actions, agent
+ * handoff, write confirmations), so retargeting writes it — it must not touch the
+ * visible editor tab (#9902). Dameng's top-level namespace is a schema, so there
+ * the target is the conversation schema, not its configured database.
+ */
+function setDatabaseTarget(database: string) {
+  const connection = boundConnection.value;
+  if (!connection || !database || isTargetNamespace(database)) return;
+  clearContextReferences();
+  selectedDatabases.value = withDatabaseSelected(selectedDatabases.value, database);
+  if (resolveAiNamespaceSelection({ database: boundDatabase.value, schema: boundSchema.value }, connection).kind === "schema") {
+    void rebindConversation(connection, boundDatabase.value, database);
+    return;
   }
+  // A schema belongs to one database: the previous one may not exist (or may
+  // name a different namespace) in the database being retargeted, and it is used
+  // for metadata reads and SQL execution alike (#12972). Re-pick it instead.
+  void rebindConversation(connection, database, undefined);
 }
 
 const selectedNamespace = computed(() => (boundConnection.value ? resolveAiNamespaceSelection({ database: boundDatabase.value, schema: boundSchema.value }, boundConnection.value).value : ""));
 
-// Reset the composer's database multi-select whenever the *namespace* changes.
+/** Scope a selection belongs to; see `resolveComposerDatabaseReset`. */
+const composerDatabaseScope = computed<AiComposerScope>(() => ({
+  conversationId: conversationId.value,
+  connectionId: boundConnectionId.value,
+  namespace: selectedNamespace.value,
+}));
+
+// Reset the composer's database multi-select when the *scope* moves: another
+// conversation, another connection, or (on schema-scoped engines such as Dameng)
+// another namespace.
 //
 // `selectedDatabases` is a single ref for the whole panel, and the key used to be
 // `connection:tab` — so switching to another conversation kept the previous one's
 // selection, i.e. the "bound database" leaked between chats (#9902). The
 // conversation id belongs in the key; the namespace keeps a fresh, unsaved chat
-// following the visible tab. A bound conversation's namespace no longer depends
-// on the visible tab, so switching tabs inside it no longer resets the selection.
-watch(
-  () => `${boundConnectionId.value}\u0000${boundDatabase.value}\u0000${boundSchema.value ?? ""}\u0000${conversationId.value}`,
-  () => {
-    const next = selectedNamespace.value ? [selectedNamespace.value] : [];
-    // A chip naming a database this namespace change just dropped out of the
-    // selection would be quoted in the message while the run refuses to read it
-    // (#11660) — the same rule the deselect handler applies, at the other place
-    // the selection changes. An unresolved namespace prunes nothing: the chip is
-    // inert and the request-time scope guard still refuses it.
-    if (next.length) removeMentionsOfDatabases(selectedDatabases.value.filter((database) => !next.includes(database)));
-    selectedDatabases.value = next;
-  },
-);
+// following the visible tab.
+//
+// A schema change on a database-scoped engine is deliberately NOT a scope change:
+// the schema belongs to the target database, and resetting here used to move the
+// chat back to the connection's default database (`postgres` on PostgreSQL) while
+// the picker still showed the user's choice (#12972).
+watch(composerDatabaseScope, (next, previous) => {
+  const reset = resolveComposerDatabaseReset(previous, next, selectedDatabases.value);
+  if (!reset) return;
+  // A chip naming a database this scope change just dropped out of the
+  // selection would be quoted in the message while the run refuses to read it
+  // (#11660) — the same rule the deselect handler applies, at the other place
+  // the selection changes. An unresolved namespace prunes nothing: the chip is
+  // inert and the request-time scope guard still refuses it.
+  if (reset.length) removeMentionsOfDatabases(selectedDatabases.value.filter((database) => !reset.includes(database)));
+  selectedDatabases.value = reset;
+});
 watch([dbSelectOptions, selectedNamespace], syncSelectedDatabases, { immediate: true });
 
 const showAiDatabaseSelector = computed(() => !!boundConnection.value && supportsAiAssistantContext(boundConnection.value.db_type));
@@ -2791,15 +2923,24 @@ function parseExplainFromData(explainData: unknown, dbType: string): ParsedExpla
 }
 
 /** Sends the user's answer for a pending plugin tool approval back to the run that asked. */
+const cancelledToolApprovalSessions = new Set<string>();
+function cancelToolApprovals(sessionId: string, transcript = messages.value) {
+  if (!sessionId) return;
+  cancelledToolApprovalSessions.add(sessionId);
+  cancelSessionToolApprovals(transcript, sessionId);
+}
+
 async function resolveToolApproval(step: AiAgentStepItem, approved: boolean) {
   const approval = step.approval;
-  if (!approval || approval.status !== "pending") return;
+  if (!approval || approval.status !== "pending" || cancelledToolApprovalSessions.has(approval.sessionId)) return;
   approval.status = "submitting";
   try {
     // The final status arrives with `tool_approval_resolved`; `false` means
     // the run stopped waiting (timed out, cancelled, or app restarted).
-    if (!(await resolveAiToolApproval(approval.sessionId, approval.approvalId, approved))) approval.status = "expired";
+    const accepted = await resolveAiToolApproval(approval.sessionId, approval.approvalId, approved);
+    if (!accepted && !cancelledToolApprovalSessions.has(approval.sessionId)) approval.status = "expired";
   } catch (error) {
+    if (cancelledToolApprovalSessions.has(approval.sessionId)) return;
     approval.status = "pending";
     toast(t("ai.toolApproval.answerFailed", { message: error instanceof Error ? error.message : String(error) }), 5000);
   }
@@ -4019,6 +4160,11 @@ async function send() {
   // A background auto-send has no composer of its own, so it runs on the
   // conversation's own database.
   const runDatabases = connection && tab && resolveAiNamespaceSelection(tab, connection).kind === "database" ? (auto || confirmationRetargets ? [runBinding.database] : [...selectedDatabases.value]) : [];
+  // Keep the submitted SQL paired with `text` even if another external fix
+  // replaces the composer while skills or prompt templates are loading.
+  // Like other composer context, selections cannot cross a confirmation target.
+  const selectionContexts = auto || confirmationRetargets ? [] : [...selectedEditorSelections.value];
+  const composerSelectionIds = new Set(selectedEditorSelections.value.map((selection) => selection.id));
   const activeConfig = activeFullConfig.value;
   if (!activeConfig) {
     clearPendingWriteGrant();
@@ -4255,9 +4401,6 @@ async function send() {
   const selectedSqlFiles = auto || confirmationRetargets || runPluginContext ? [] : [...selectedSqlFileMentions.value];
   const csvAttachments = auto || confirmationRetargets ? [] : [...selectedCsvAttachments.value];
   const imageAttachments = auto || confirmationRetargets ? [] : [...selectedImageAttachments.value];
-  // A selection describes the namespace the user picked it in, so it is dropped
-  // exactly like the other composer context when the run targets another one.
-  const selectionContexts = auto || confirmationRetargets ? [] : [...selectedEditorSelections.value];
   const mentionedTables = [...selectedTableMentions, ...parseAiTableMentions(text, runDatabases)];
   const modelInstruction = buildAiModelInstruction({
     tableMentionRaws: selectedTableMentions.map((mention) => mention.raw),
@@ -4283,12 +4426,15 @@ async function send() {
     }
     historyIndex.value = -1;
     draftBeforeHistory.value = "";
-    prompt.value = "";
+    // Consume only this send's selections. A later fix stays staged with its
+    // error, including when both failures have the same error text.
+    const pendingSelections = selectedEditorSelections.value.filter((selection) => !composerSelectionIds.has(selection.id));
+    if (prompt.value.trim() === text && pendingSelections.length === 0) prompt.value = "";
     selectedMentions.value = [];
     selectedSqlFileMentions.value = [];
     selectedCsvAttachments.value = [];
     selectedImageAttachments.value = [];
-    selectedEditorSelections.value = [];
+    selectedEditorSelections.value = pendingSelections;
   }
   if (autoSendVisible) scrollToBottom({ force: true });
 
@@ -4518,12 +4664,10 @@ async function send() {
         else appendAssistantReasoning(assistantIdx, event.delta);
       }
       if (event.type === "output_truncated") {
-        // The provider cut the answer off at its output limit; without this the card
-        // would look like a finished reply. Appended in the user's own locale, like
-        // every other string the panel writes.
-        const notice = `\n\n[${t("ai.outputTruncated")}]`;
-        if (detachedDeltaBuffer) detachedDeltaBuffer.appendText(assistantIdx, notice);
-        else appendAssistantDelta(assistantIdx, notice);
+        // Keep UI notices out of model history and unfinished Markdown fences.
+        // `kind` already survives conversation snapshots and reloads.
+        const msg = runMessages[assistantIdx];
+        if (msg) msg.kind = "outputTruncated";
       }
       if (event.type === "agent_end") {
         // End the card's "思考过程" spinner at the terminal event rather than
@@ -4568,8 +4712,8 @@ async function send() {
         }
       }
       // A plugin tool call waits for (or got) the user's approval: keep the
-      // state on the tool card so the answer buttons live next to the call.
-      if (event.type === "tool_approval_required" || event.type === "tool_approval_resolved") {
+      // state on the tool step; pending decisions are docked above the composer.
+      if ((event.type === "tool_approval_required" || event.type === "tool_approval_resolved") && !cancelledToolApprovalSessions.has(sessionId)) {
         const msg = runMessages[assistantIdx];
         if (msg?.agentSteps) {
           const key = toolCallStepKey(event.tool_call_id, agentEvents.length - 1, "tool_call_start");
@@ -4638,13 +4782,14 @@ async function send() {
       // paying for buildAiContext() too; it can do real backend/schema work that
       // would be entirely wasted on an already-abandoned request.
       if (!generationCanContinue()) return;
-      const requestDatabase = runDatabases[0] ?? tab.database;
+      // The run's primary database is the chat's execution target (the picker's
+      // "target"), not the first database in the context selection: the model
+      // must answer for the database its SQL will actually run on (#12972).
+      const requestDatabase = tab.database;
       const context = await buildAiContext(
-        {
-          ...tab,
-          database: requestDatabase,
-          schema: runDatabases.length > 1 || requestDatabase !== tab.database ? undefined : tab.schema,
-        },
+        // The schema belongs to the target database; extra context databases must
+        // not drop it — they are only readable alongside the target.
+        { ...tab, database: requestDatabase },
         connection,
         {
           databases: runDatabases,
@@ -4652,6 +4797,7 @@ async function send() {
           sqlFiles,
           csvFiles: csvAttachments,
           selections: selectionContexts,
+          includeQueryResult: settings.includeQueryResult,
         },
       );
       context.selectedDatabases = runDatabases;
@@ -4701,6 +4847,7 @@ async function send() {
       if (msg) {
         msg.content = `${t("ai.requestFailed")}\n\n${translateBackendError(t, message)}`;
         msg.failed = true;
+        if (msg.kind === "outputTruncated") msg.kind = undefined;
       }
       if (detachedRun) finishDesktopAiRun(detachedRun, "failed");
     }
@@ -4983,6 +5130,8 @@ function releaseDeletedRunSlot(run: DesktopAiRunRuntime<ChatMessage>) {
  *  force-finalized so the queue can never wedge. */
 async function stopDesktopAiRun(run: DesktopAiRunRuntime<ChatMessage>) {
   run.cancelRequested = true;
+  for (const sessionId of run.sessionIds) cancelToolApprovals(sessionId, run.messages);
+  cancelToolApprovals(run.currentSessionId, run.messages);
   if (run.status === "queued") {
     // Never admitted: no backend session and no slot - finalize immediately.
     cancelQueuedDesktopAiRun(run);
@@ -5029,6 +5178,7 @@ async function stopDesktopAiRun(run: DesktopAiRunRuntime<ChatMessage>) {
 }
 
 async function cancelStream() {
+  cancelToolApprovals(currentSessionId.value);
   // User explicitly requested stop — reflect it in the status line (phase=cancelling)
   // so it reads "正在取消…" while the backend cancellation is still settling.
   if (isGenerating.value) {
@@ -5088,6 +5238,7 @@ function resetPendingRequestState() {
   // unmount must drop it synchronously, or "识别中" stays on screen in the next
   // conversation until that bounded call settles.
   routingInFlight.value = false;
+  clearSqlActionBlockStatuses();
 }
 
 // `alreadyCancelledSessionId`: the session id a caller (cancelStream()) has
@@ -5110,6 +5261,7 @@ function abandonInFlightRequest(alreadyCancelledSessionId?: string) {
   // they can't write into the array this call is about to replace. See
   // lib/ai/aiGenerationGuard.ts.
   const sessionId = currentSessionId.value;
+  cancelToolApprovals(sessionId);
   aiGenerationGuard.invalidate();
   isGenerating.value = false;
   currentSessionId.value = "";
@@ -5120,28 +5272,126 @@ function abandonInFlightRequest(alreadyCancelledSessionId?: string) {
   }
 }
 
-function applySql(code: string) {
+function applySql(code: string, key: string) {
   if (isRedisConnection.value) {
     emit("insertRedisCommand", code, conversationBinding.value);
     return;
   }
-  emit("appendSql", code, conversationBinding.value);
+  // Start the block's status before the request leaves: the target tab may not
+  // be on screen, so this block is the only place the user can see it happen.
+  const requestId = beginSqlAction(key);
+  emit("appendSql", code, conversationBinding.value, requestId);
 }
 
-function executeSql(code: string) {
+function executeSql(code: string, key: string) {
   if (isRedisConnection.value) {
     emit("executeRedisCommand", code, conversationBinding.value);
     return;
   }
-  emit("executeSql", code, conversationBinding.value);
+  const requestId = beginSqlAction(key);
+  emit("executeSql", code, conversationBinding.value, requestId);
 }
 
-function tempRunSql(code: string) {
+function tempRunSql(code: string, key: string) {
   if (isRedisConnection.value) {
     emit("executeRedisCommand", code, conversationBinding.value);
     return;
   }
-  emit("tempRunSql", code, conversationBinding.value);
+  const requestId = beginSqlAction(key);
+  emit("tempRunSql", code, conversationBinding.value, requestId);
+}
+
+/**
+ * Per-SQL-block action status (#11962). The panel is the only surface that can
+ * report an AI action's outcome when its editor tab is not on screen, so each
+ * block tracks the request it started and renders running/succeeded/failed
+ * inline.
+ */
+type AiSqlBlockStatus =
+  /** `requestId` is the click this block currently waits for (see beginSqlAction). */
+  | { phase: "running"; requestId: number }
+  | { phase: "succeeded"; rows?: number; affectedRows?: number }
+  /** `apply` appended the SQL to the editor: there is no execution to summarise. */
+  | { phase: "applied" }
+  | { phase: "failed"; message: string }
+  | { phase: "unavailable"; message: string };
+
+const aiSqlBlockStatuses = ref<Map<string, AiSqlBlockStatus>>(new Map());
+const pendingSqlActionRequests = new Map<number, string>();
+let nextSqlActionRequestId = 0;
+
+function beginSqlAction(key: string): number {
+  const requestId = ++nextSqlActionRequestId;
+  pendingSqlActionRequests.set(requestId, key);
+  const next = new Map(aiSqlBlockStatuses.value);
+  // A second click on the same block supersedes the first: the block tracks the
+  // request it is waiting for, so the earlier response cannot overwrite it.
+  next.set(key, { phase: "running", requestId });
+  aiSqlBlockStatuses.value = next;
+  return requestId;
+}
+
+/**
+ * Block keys are positional (`code:${messageIndex}:${segment}`), so a status only
+ * means anything while the transcript that produced it is still on screen.
+ * Every path that replaces or truncates the transcript must drop them, or a
+ * stale "failed" line renders on whatever block now sits at that index — in this
+ * chat after an edit-resend, or in another conversation entirely. The call sites
+ * are `selectConversation`, `clearMessages`, the edit-resend truncation, and
+ * `resetPendingRequestState`.
+ */
+function clearSqlActionBlockStatuses() {
+  if (aiSqlBlockStatuses.value.size) aiSqlBlockStatuses.value = new Map();
+  pendingSqlActionRequests.clear();
+}
+
+/** Host callback: settles the block that started request `requestId`. */
+function reportAiSqlAction(report: AiSqlActionReport) {
+  const key = pendingSqlActionRequests.get(report.requestId);
+  if (key === undefined) return;
+  pendingSqlActionRequests.delete(report.requestId);
+  const pending = aiSqlBlockStatuses.value.get(key);
+  if (pending?.phase === "running" && pending.requestId !== report.requestId) {
+    // The block was clicked again while this request was in flight; that later
+    // click owns the block's status, so this stale answer is dropped.
+    return;
+  }
+  const next = new Map(aiSqlBlockStatuses.value);
+  if (report.status === "dismissed") {
+    // The user answered a dialog (danger/production/parameters/read-only) or the
+    // request was cancelled: there is no outcome to report, so drop the state
+    // instead of leaving the block spinning forever.
+    next.delete(key);
+  } else if (report.status === "succeeded") {
+    next.set(key, { phase: "succeeded", rows: report.rows, affectedRows: report.affectedRows });
+  } else if (report.status === "applied") {
+    next.set(key, { phase: "applied" });
+  } else if (report.status === "failed") {
+    next.set(key, { phase: "failed", message: report.message ?? "" });
+  } else {
+    next.set(key, { phase: "unavailable", message: report.message ?? "" });
+  }
+  aiSqlBlockStatuses.value = next;
+}
+
+const sqlBlockKey = (messageIndex: number, segmentIndex: number) => `code:${messageIndex}:${segmentIndex}`;
+
+/** Status of one SQL block's action, or `undefined` when nothing ran from it. */
+function sqlBlockStatus(messageIndex: number, segmentIndex: number): AiSqlBlockStatus | undefined {
+  return aiSqlBlockStatuses.value.get(sqlBlockKey(messageIndex, segmentIndex));
+}
+
+function sqlBlockStatusText(messageIndex: number, segmentIndex: number): string {
+  const status = sqlBlockStatus(messageIndex, segmentIndex);
+  if (!status) return "";
+  if (status.phase === "running") return t("ai.sqlActionRunning");
+  if (status.phase === "applied") return t("ai.sqlActionApplied");
+  if (status.phase === "succeeded") {
+    if (status.affectedRows) return t("ai.sqlActionSucceededAffected", { count: status.affectedRows });
+    if (status.rows) return t("ai.sqlActionSucceededRows", { count: status.rows });
+    return t("ai.sqlActionSucceeded");
+  }
+  return status.message;
 }
 
 const copiedContentKey = ref("");
@@ -5314,6 +5564,8 @@ function clearMessages() {
   // the transcript, so returning to this conversation shows what changed.
   if (conversationId.value) conversationReadMessageCount.set(conversationId.value, visibleMessages.value.length);
   messages.value = [];
+  // Positional SQL-block statuses belong to the transcript just wiped.
+  clearSqlActionBlockStatuses();
   draftPluginContext.value = undefined;
   clearContextReferences();
   clearPendingWriteGrant();
@@ -5667,6 +5919,9 @@ function selectConversation(conv: AiConversation) {
   skillHintLatch.value = null;
   const activeRun = backgroundAiRunsEnabled ? desktopAiRun<ChatMessage>(conv.id) : undefined;
   messages.value = activeRun?.messages ?? chatMessagesFromConversation(conv);
+  // Block keys are positional, so the arriving transcript must not inherit the
+  // departing conversation's statuses (#11962).
+  clearSqlActionBlockStatuses();
   // Req 13 after a restart: the transcript keeps the fact that skills were
   // loaded, so the chips can light up before anything is read again. The bodies
   // come back when a request actually needs them (`rehydrateLoadedSkillBodies`).
@@ -6126,7 +6381,8 @@ async function applyResponsiveControlMeasurement(panel: HTMLElement, panelWidth:
 
   const contextRow = panel.querySelector<HTMLElement>("[data-ai-composer-context-row]");
   const actionRow = panel.querySelector<HTMLElement>("[data-ai-composer-actions]");
-  const contextOverflow = hasHorizontalOverflow(contextRow) || hasOverflowingLabel(contextRow, ".ai-template-selector-label, .ai-skills-selector-label");
+  // Context fields wrap as complete controls; truncated names are intentional.
+  const contextOverflow = hasHorizontalOverflow(contextRow);
 
   compactContextControls.value = contextOverflow;
   if (actionControlsOverflow(actionRow)) {
@@ -6374,6 +6630,9 @@ function openExternalContext(request: AiExternalContextRequest) {
   }
   applyDraftBinding(plan.binding);
   if (!plan.binding.connectionId && request.unresolvedKey) toast(t(request.unresolvedKey), 5000);
+  // An explicit failed result replaces staged SQL selections, including a
+  // previous failed query. It must not be dropped by a full selection budget.
+  if (request.action === "fix" && request.selections?.some((selection) => selection.source === "query-error")) selectedEditorSelections.value = [];
   for (const selection of request.selections ?? []) {
     const budgetError = selectionContextBudgetError(selectedEditorSelections.value);
     if (budgetError) {
@@ -6442,7 +6701,14 @@ function focusSearch(): boolean {
   return true;
 }
 
-defineExpose({ openPluginConversation, openExternalContext, triggerAction, clearContextReferences, selectConversationById, focusSearch });
+async function prepareForWindowClose() {
+  if (backgroundAiRunsEnabled) return;
+  flushAssistantDeltas();
+  if (isGenerating.value) abandonInFlightRequest();
+  await persistConversation();
+}
+
+defineExpose({ openPluginConversation, openExternalContext, triggerAction, clearContextReferences, selectConversationById, focusSearch, reportAiSqlAction, prepareForWindowClose });
 
 const messageRenderer = computed(() => {
   const appearance = aiCodeAppearance.value;
@@ -6844,7 +7110,7 @@ async function openExternalUrl(url: string) {
             </div>
 
             <!-- Keep the metadata row as wide as the reply card so its export action stays right-aligned. -->
-            <div v-else-if="msg.content || msg.reasoning || msg.isThinking" class="flex w-full max-w-[95%] min-w-0 flex-col">
+            <div v-else-if="msg.content || msg.reasoning || msg.isThinking || msg.kind === 'outputTruncated'" class="flex w-full max-w-[95%] min-w-0 flex-col">
               <div data-ai-assistant-message-content class="ai-conversation-text w-full rounded-lg bg-muted px-3 py-2 text-xs leading-relaxed [overflow-wrap:anywhere]">
                 <div v-if="msg.reasoning || msg.isThinking" class="mb-2">
                   <button class="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors" @click="toggleReasoning()">
@@ -6881,7 +7147,7 @@ async function openExternalUrl(url: string) {
                       <span v-else-if="step.durationMs !== undefined" class="ml-auto shrink-0 tabular-nums" :class="step.tone === 'danger' ? 'text-red-600 dark:text-red-400' : 'text-chart-2'">{{ formatToolDurationMs(step.durationMs) }}</span>
                       <ChevronRight v-if="step.toolResult || step.toolArgs?.sql" class="h-3 w-3 shrink-0 transition-transform duration-150" :class="[{ 'rotate-90': expandedSteps.has(step.key) }, !agentStepHasTail(step) ? 'ml-auto' : '']" />
                     </button>
-                    <AiToolApprovalCard v-if="step.approval" :approval="step.approval" @resolve="resolveToolApproval(step, $event)" />
+                    <AiToolApprovalCard v-if="step.approval && !pendingApprovalSteps.includes(step)" :approval="step.approval" @resolve="resolveToolApproval(step, $event)" />
                     <div v-if="expandedSteps.has(step.key)" class="border-t border-current/10 px-2 pb-2 pt-1">
                       <div v-if="step.toolArgs?.sql" class="mb-1 rounded bg-background/50 px-2 py-1 font-mono text-[10px] text-foreground/80 whitespace-pre-wrap">{{ step.toolArgs.sql }}</div>
                       <Button v-if="step.toolName === 'explain_query' && step.toolArgs?.sql" size="sm" variant="outline" class="mb-1 h-6 gap-1 text-[10px]" @click="emit('openExplainPlan', step.toolArgs.sql as string, conversationBinding)">
@@ -6914,7 +7180,7 @@ async function openExternalUrl(url: string) {
                           v-if="!pluginContext && !seg.pending && seg.isSql && !isRedisConnection"
                           class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200"
                           :title="t('ai.tempRunSql')"
-                          @click="tempRunSql(seg.content)"
+                          @click="tempRunSql(seg.content, sqlBlockKey(i, j))"
                         >
                           <FlaskConical class="h-3.5 w-3.5" />
                         </button>
@@ -6922,7 +7188,7 @@ async function openExternalUrl(url: string) {
                           v-if="!pluginContext && !seg.pending && (seg.isSql || isRedisConnection)"
                           class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200"
                           :title="t('ai.executeSql')"
-                          @click="executeSql(seg.content)"
+                          @click="executeSql(seg.content, sqlBlockKey(i, j))"
                         >
                           <Play class="h-3.5 w-3.5" />
                         </button>
@@ -6930,7 +7196,7 @@ async function openExternalUrl(url: string) {
                           v-if="!pluginContext && !seg.pending && (seg.isSql || isRedisConnection)"
                           class="rounded p-0.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-700 dark:hover:text-zinc-200"
                           :title="t('ai.apply')"
-                          @click="applySql(seg.content)"
+                          @click="applySql(seg.content, sqlBlockKey(i, j))"
                         >
                           <ArrowDownToLine class="h-3.5 w-3.5" />
                         </button>
@@ -6948,8 +7214,34 @@ async function openExternalUrl(url: string) {
                       </div>
                     </div>
                     <pre class="ai-code-block whitespace-pre-wrap break-words [overflow-wrap:anywhere] p-3 text-xs leading-relaxed text-zinc-900 dark:text-zinc-100"><code v-html="seg.html"></code></pre>
+                    <!-- #11962: the outcome of an action started from THIS block, so the
+                         user sees it without hunting for the target editor tab. The row
+                         stays mounted while the action runs, so its running → terminal
+                         text change is announced; `role="status"` matches the other
+                         block-level notices in this file. -->
+                    <div
+                      v-if="sqlBlockStatus(i, j)"
+                      data-ai-sql-action-status
+                      role="status"
+                      class="border-t border-zinc-200 px-3 py-1.5 text-[10px] dark:border-zinc-700/50"
+                      :class="sqlBlockStatus(i, j)?.phase === 'failed' || sqlBlockStatus(i, j)?.phase === 'unavailable' ? 'text-red-600 dark:text-red-400' : 'text-zinc-500 dark:text-zinc-400'"
+                    >
+                      <span class="flex items-start gap-1.5">
+                        <Loader2 v-if="sqlBlockStatus(i, j)?.phase === 'running'" class="mt-px h-3 w-3 shrink-0 animate-spin" />
+                        <Check v-else-if="sqlBlockStatus(i, j)?.phase === 'succeeded' || sqlBlockStatus(i, j)?.phase === 'applied'" class="mt-px h-3 w-3 shrink-0 text-emerald-500" />
+                        <CircleSlash v-else class="mt-px h-3 w-3 shrink-0" />
+                        <span class="min-w-0 whitespace-pre-wrap break-words">{{ sqlBlockStatusText(i, j) }}</span>
+                      </span>
+                    </div>
                   </div>
                 </template>
+                <div v-if="msg.kind === 'outputTruncated'" data-ai-output-truncated role="status" class="mt-2 space-y-2 border-t border-border pt-2 text-muted-foreground">
+                  <p>{{ t("ai.outputTruncated") }}</p>
+                  <Button v-if="msg === truncatedReply" data-ai-continue-generation type="button" size="sm" variant="outline" class="h-7 gap-1 text-[11px]" :disabled="isGenerating || isAttachmentProcessing || !!currentQueuedInput || !activeFullConfig" @click="continueTruncatedReply(msg)">
+                    <Play class="h-3 w-3" />
+                    {{ t("ai.continueGeneration") }}
+                  </Button>
+                </div>
                 <div v-if="msg === proposalConfirmMessage" class="mt-2 flex gap-2" :title="t('ai.proposalConfirmTitle')">
                   <Button size="sm" variant="default" class="h-7 gap-1 text-[11px]" @click="sendProposalReply(true)">
                     <Check class="h-3 w-3" />
@@ -7054,64 +7346,83 @@ async function openExternalUrl(url: string) {
       </button>
     </div>
 
-    <div class="p-2">
+    <!-- Pending approvals live outside the transcript scroll area so long
+         model output cannot scroll the decision controls out of view. -->
+    <div v-if="pendingApprovalSteps.length" class="max-h-[40%] shrink-0 overflow-y-auto border-t border-border/60 bg-background/95 px-2 py-2" data-ai-tool-approval-dock>
+      <AiToolApprovalCard v-for="step in pendingApprovalSteps" :key="`${step.approval!.sessionId}:${step.approval!.approvalId}`" :approval="step.approval!" @resolve="resolveToolApproval(step, $event)" />
+    </div>
+
+    <div class="shrink-0 p-2">
       <div ref="promptPanelRef" class="ai-prompt-context-container relative rounded-[6px] border bg-background">
         <div v-if="isAttachmentDragging" class="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-[6px] border-2 border-dashed border-primary bg-background/90 text-sm font-medium text-foreground shadow-sm backdrop-blur-sm">
           {{ t("ai.attachmentDropHint") }}
         </div>
         <div class="resize-handle" @mousedown="startResize"></div>
         <div class="px-2 pb-2 pt-1">
-          <div data-ai-composer-context-row :class="['ai-prompt-context-row mb-1 flex min-w-0 items-center gap-x-1 text-xs text-foreground/80', showAiSchemaSelector && 'ai-prompt-context-row--schema', compactContextControls && 'ai-prompt-context-row--compact']">
+          <div data-ai-composer-context-row :class="['ai-prompt-context-row mb-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-foreground/80', showAiSchemaSelector && 'ai-prompt-context-row--schema', compactContextControls && 'ai-prompt-context-row--compact']">
             <div v-if="pluginContext && !connectionStore.connections.length" class="flex min-w-0 max-w-[14rem] items-center gap-1" data-ai-plugin-context :title="pluginContext.title">
               <ConnectionIcon v-if="pluginContextConnection" :connection="pluginContextConnection" class="h-3 w-3 shrink-0" />
               <Server v-else class="h-3 w-3 shrink-0" />
               <span class="truncate">{{ pluginComposerConnectionName }}</span>
             </div>
-            <template v-if="connectionStore.connections.length">
-              <ConnectionIcon v-if="boundConnection" :connection="boundConnection" class="h-3 w-3 shrink-0" />
-              <Server v-else class="h-3 w-3 shrink-0" />
-              <ConnectionTreeSelect
-                :model-value="boundConnectionId"
-                :connections="connectionStore.connections"
-                :layout="connectionStore.sidebarLayout"
-                :placeholder="t('editor.selectConnection')"
-                :search-placeholder="t('editor.searchConnection')"
-                :empty-text="t('grid.noSearchResults')"
-                :trigger-class="['h-5 min-w-0 max-w-full px-1 text-foreground/80', showAiSchemaSelector && 'max-w-56 flex-1']"
-                trigger-icon-class="h-3 w-3"
-                list-class="w-72 max-w-[calc(100vw-2rem)]"
-                @update:model-value="(v) => changeConnection(v)"
-              />
+            <div v-if="connectionStore.connections.length" class="flex min-w-0 max-w-full flex-none flex-wrap items-center gap-x-2 gap-y-1">
+              <div class="flex min-w-0 max-w-full flex-none items-center gap-1">
+                <ConnectionIcon v-if="boundConnection" :connection="boundConnection" class="h-3 w-3 shrink-0" />
+                <Server v-else class="h-3 w-3 shrink-0" />
+                <ConnectionTreeSelect
+                  :model-value="boundConnectionId"
+                  :connections="connectionStore.connections"
+                  :layout="connectionStore.sidebarLayout"
+                  :placeholder="t('editor.selectConnection')"
+                  :search-placeholder="t('editor.searchConnection')"
+                  :empty-text="t('grid.noSearchResults')"
+                  trigger-class="h-5 min-w-0 max-w-56 shrink px-1 text-foreground/80"
+                  trigger-icon-class="h-3 w-3"
+                  list-class="w-72 max-w-[calc(100vw-2rem)]"
+                  @update:model-value="(v) => changeConnection(v)"
+                />
+              </div>
               <template v-if="boundConnection && showAiDatabaseSelector">
-                <Popover
-                  @update:open="
-                    (open: boolean) => {
-                      if (open) loadDatabases();
-                    }
-                  "
-                >
-                  <PopoverTrigger as-child>
-                    <Button variant="ghost" :title="selectedDatabaseLabel" :aria-label="selectedDatabaseLabel" :class="['ai-database-selector-trigger h-5 min-w-0 max-w-64 justify-start gap-1 border-0 p-0 px-1 text-xs font-normal text-foreground/80 shadow-none', showAiSchemaSelector && 'flex-1']">
-                      <Database class="ai-database-selector-icon h-3 w-3 shrink-0 text-foreground/40" />
-                      <span class="truncate">{{ selectedDatabaseLabel }}</span>
-                    </Button>
-                  </PopoverTrigger>
-                  <PopoverContent align="start" class="w-80 max-w-[calc(100vw-2rem)] p-1">
-                    <div class="relative mb-1 flex items-center border-b px-2 py-1">
-                      <Search class="pointer-events-none absolute left-3 h-3 w-3 text-muted-foreground" />
-                      <input v-model="databaseSearchQuery" type="search" class="h-6 w-full bg-transparent pl-5 text-xs outline-none placeholder:text-muted-foreground" :placeholder="t('ai.searchDatabases')" />
-                    </div>
-                    <button v-if="selectedDatabases.length > 1" type="button" class="mb-1 flex w-full items-center justify-end gap-1 border-b px-2 py-1 text-xs" @click.stop="selectedDatabases = []"><X class="h-3 w-3" />{{ t("ai.clearDatabaseSelection") }}</button>
-                    <div class="max-h-64 overflow-y-auto overscroll-contain">
-                      <button v-for="option in filteredDbSelectOptions" :key="option.value" type="button" :title="option.label" class="flex w-full min-w-0 items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-muted" @click="toggleDatabase(option.database)">
-                        <Check :class="['h-4 w-4 shrink-0', selectedDatabaseValues.has(option.database) ? 'opacity-100' : 'opacity-0']" />
-                        <span class="min-w-0 flex-1 truncate">{{ option.label }}</span>
-                      </button>
-                      <div v-if="!filteredDbSelectOptions.length" class="px-2 py-1.5 text-sm text-muted-foreground">{{ t("ai.noDatabasesFound") }}</div>
-                    </div>
-                  </PopoverContent>
-                </Popover>
-                <template v-if="showAiSchemaSelector">
+                <div class="flex min-w-0 max-w-full flex-none items-center">
+                  <Popover
+                    @update:open="
+                      (open: boolean) => {
+                        if (open) loadDatabases();
+                      }
+                    "
+                  >
+                    <PopoverTrigger as-child>
+                      <Button variant="ghost" :title="selectedDatabaseLabel" :aria-label="selectedDatabaseLabel" class="ai-database-selector-trigger h-5 min-w-0 max-w-64 shrink justify-start gap-1 border-0 p-0 px-1 text-xs font-normal text-foreground/80 shadow-none">
+                        <Database class="ai-database-selector-icon h-3 w-3 shrink-0 text-foreground/40" />
+                        <!-- Non-target databases are read-only context; the target is
+                           where AI SQL actions run, so it is marked in the trigger (#12972). -->
+                        <span v-if="selectedNamespace" class="flex shrink-0 items-center" :title="t('ai.databaseTarget')" data-ai-database-target-icon>
+                          <Target class="h-3 w-3 text-primary/70" />
+                        </span>
+                        <span class="truncate">{{ selectedDatabaseLabel }}</span>
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent align="start" class="w-80 max-w-[calc(100vw-2rem)] p-1">
+                      <div class="relative mb-1 flex items-center border-b px-2 py-1">
+                        <Search class="pointer-events-none absolute left-3 h-3 w-3 text-muted-foreground" />
+                        <input v-model="databaseSearchQuery" type="search" class="h-6 w-full bg-transparent pl-5 text-xs outline-none placeholder:text-muted-foreground" :placeholder="t('ai.searchDatabases')" />
+                      </div>
+                      <button v-if="selectedDatabases.length > 1" type="button" class="mb-1 flex w-full items-center justify-end gap-1 border-b px-2 py-1 text-xs" @click.stop="clearDatabaseSelection()"><X class="h-3 w-3" />{{ t("ai.clearDatabaseSelection") }}</button>
+                      <div class="max-h-64 overflow-y-auto overscroll-contain">
+                        <div v-for="option in filteredDbSelectOptions" :key="option.value" class="flex w-full min-w-0 items-center gap-1 rounded-sm pr-1 text-sm hover:bg-muted">
+                          <button type="button" :title="option.label" class="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left" @click="toggleDatabase(option.database)">
+                            <Check :class="['h-4 w-4 shrink-0', selectedDatabaseValues.has(option.database) ? 'opacity-100' : 'opacity-0']" />
+                            <span class="min-w-0 flex-1 truncate">{{ option.label }}</span>
+                          </button>
+                          <span v-if="isTargetNamespace(option.database)" class="shrink-0 rounded-sm bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary" data-ai-database-target>{{ t("ai.databaseTarget") }}</span>
+                          <button v-else type="button" class="shrink-0 rounded-sm px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-foreground/5 hover:text-foreground" data-ai-database-target-action @click.stop="setDatabaseTarget(option.database)">{{ t("ai.setDatabaseTarget") }}</button>
+                        </div>
+                        <div v-if="!filteredDbSelectOptions.length" class="px-2 py-1.5 text-sm text-muted-foreground">{{ t("ai.noDatabasesFound") }}</div>
+                      </div>
+                    </PopoverContent>
+                  </Popover>
+                </div>
+                <div v-if="showAiSchemaSelector" class="flex min-w-0 max-w-full flex-none items-center gap-1">
                   <Layers class="h-3 w-3 shrink-0 text-foreground/40" />
                   <SearchableSelect
                     :model-value="boundSchema || ''"
@@ -7122,7 +7433,7 @@ async function openExternalUrl(url: string) {
                     :loading-text="t('common.loading')"
                     :loading="isLoadingSchemas(boundConnection.id, aiSchemaDatabaseKey)"
                     trigger-variant="ghost"
-                    trigger-class="h-5 min-w-0 max-w-36 flex-1 p-0 px-1 text-foreground/80"
+                    trigger-class="h-5 min-w-0 max-w-36 shrink p-0 px-1 text-foreground/80"
                     trigger-icon-class="h-3 w-3"
                     list-class="w-56"
                     @update:model-value="changeSchema"
@@ -7132,134 +7443,135 @@ async function openExternalUrl(url: string) {
                       }
                     "
                   />
-                </template>
+                </div>
               </template>
-            </template>
-            <span class="ai-prompt-context-spacer min-w-0 flex-1" />
-            <!-- Template selector -->
-            <Popover v-if="!pluginContext" v-model:open="showTemplateSelector">
-              <PopoverTrigger as-child>
-                <button
-                  type="button"
-                  class="ai-template-selector-trigger flex min-w-0 max-w-[40%] items-center gap-1 rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
-                  :aria-label="templateSelectorTriggerLabel"
-                  :title="templateSelectorTriggerLabel"
-                >
-                  <FileCode class="h-3 w-3" />
-                  <span class="ai-template-selector-label truncate">{{ templateSelectorTriggerLabel }}</span>
-                  <svg class="ai-template-selector-chevron h-3 w-3 shrink-0 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" /></svg>
-                </button>
-              </PopoverTrigger>
-              <PopoverContent align="end" class="w-64 gap-0 p-1.5">
-                <div class="max-h-64 overflow-auto">
-                  <div v-if="!promptTemplateStore.isLoaded" class="px-3 py-4 text-center text-xs text-muted-foreground">
-                    {{ t("ai.templateSelectorLoading") }}
-                  </div>
-                  <div v-else-if="promptTemplateStore.templates.length === 0" class="px-3 py-4 text-center text-xs text-muted-foreground">
-                    {{ t("ai.templateSelectorEmpty") }}
-                  </div>
-                  <template v-else>
-                    <template v-for="tpl in promptTemplateStore.templates" :key="tpl.id">
-                      <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-muted" @click="toggleTemplateId(tpl.id)">
-                        <div class="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border" :class="activeTemplateIds.includes(tpl.id) ? 'border-primary bg-primary text-primary-foreground' : ''">
-                          <Check v-if="activeTemplateIds.includes(tpl.id)" class="h-3 w-3" />
-                        </div>
-                        <div class="flex-1 truncate text-left">
-                          <div class="flex items-center gap-1 font-medium">
-                            <span class="truncate">{{ tpl.name }}</span>
-                            <Star v-if="isDefaultTemplateForCurrentDb(tpl.id)" class="h-3 w-3 shrink-0 text-amber-500" :title="t('ai.templateDefaultBadgeTitle', { type: currentDbTypeLabel() })" />
-                          </div>
-                          <div class="text-[10px] text-muted-foreground truncate">{{ tpl.content.slice(0, 60) }}</div>
-                        </div>
-                      </button>
-                    </template>
-                  </template>
-                </div>
-                <div v-if="promptTemplateStore.isLoaded && promptTemplateStore.templates.length > 0" class="border-t mt-1 pt-1 px-1">
-                  <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" @click="deselectAllTemplates">
-                    {{ t("ai.templateSelectorDeselectAll") }}
+            </div>
+            <div class="flex min-w-0 max-w-full flex-none items-center gap-1">
+              <!-- Template selector -->
+              <Popover v-if="!pluginContext" v-model:open="showTemplateSelector">
+                <PopoverTrigger as-child>
+                  <button
+                    type="button"
+                    class="ai-template-selector-trigger flex min-w-0 max-w-56 items-center gap-1 rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                    :aria-label="templateSelectorTriggerLabel"
+                    :title="templateSelectorTriggerLabel"
+                  >
+                    <FileCode class="h-3 w-3 shrink-0" />
+                    <span class="ai-template-selector-label truncate">{{ templateSelectorTriggerLabel }}</span>
+                    <svg class="ai-template-selector-chevron h-3 w-3 shrink-0 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6" /></svg>
                   </button>
-                </div>
-              </PopoverContent>
-            </Popover>
-            <!-- Skill selector (read-only user SKILL.md library) -->
-            <Popover v-model:open="skillSelectorOpen">
-              <PopoverTrigger as-child>
-                <button
-                  type="button"
-                  class="ai-skills-selector-trigger flex min-w-0 items-center gap-1 rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
-                  :disabled="skillCapabilityUnavailable"
-                  :aria-label="skillSelectorTriggerLabel"
-                  :title="skillSelectorTriggerLabel"
-                >
-                  <Layers class="h-3 w-3" />
-                  <span class="ai-skills-selector-label truncate">{{ t("ai.skillsEntry") }}</span>
-                  <span v-if="selectedSkillIds.length" class="ai-skills-selector-count rounded-sm bg-primary px-1 text-[10px] font-medium text-primary-foreground">{{ selectedSkillIds.length }}</span>
-                </button>
-              </PopoverTrigger>
-              <PopoverContent align="end" class="w-72 gap-0 p-1.5">
-                <div class="max-h-64 overflow-auto">
-                  <div v-if="userSkillStore.isLoading && !userSkillStore.hasLoadedOnce" class="px-3 py-4 text-center text-xs text-muted-foreground">
-                    {{ t("ai.skillsLoading") }}
-                  </div>
-                  <div v-else-if="userSkillStore.lastError" class="space-y-1 px-3 py-4 text-center text-xs text-muted-foreground">
-                    <div>{{ t("ai.skillsLoadError") }}</div>
-                    <button type="button" class="text-[11px] text-primary hover:underline" @click="refreshSkills">
-                      {{ t("ai.skillsRetry") }}
-                    </button>
-                  </div>
-                  <div v-else-if="userSkillStore.totalCount === 0" class="px-3 py-4 text-center text-xs text-muted-foreground">
-                    {{ t("ai.skillsEmpty") }}
-                  </div>
-                  <template v-else>
-                    <template v-for="group in userSkillStore.groupedSkills" :key="group.source">
-                      <div class="px-2 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                        {{ t(group.source === "custom" ? "ai.skillsGroupCustom" : "ai.skillsGroupDefault") }}
-                      </div>
-                      <!-- Same-root name collision: the model addresses skills by name + source,
-                           so it cannot pick between these two, and only changing one of the two
-                           frontmatter `name` values fixes it (the folder name is irrelevant). -->
-                      <div v-if="duplicateNamesBySource.get(group.source)?.size" class="ai-skill-duplicate-note mx-2 mb-1 rounded-sm bg-amber-500/10 px-2 py-1 text-[10px] leading-snug text-amber-600">
-                        {{ t("ai.skillsDuplicateNameNote") }}
-                      </div>
-                      <template v-for="skill in group.skills" :key="skill.id">
-                        <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-muted" :aria-pressed="selectedSkillIds.includes(skill.id)" @click="toggleSkillSelected(skill.id)">
-                          <div class="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border" :class="selectedSkillIds.includes(skill.id) ? 'border-primary bg-primary text-primary-foreground' : ''">
-                            <Check v-if="selectedSkillIds.includes(skill.id)" class="h-3 w-3" />
+                </PopoverTrigger>
+                <PopoverContent align="end" class="w-64 gap-0 p-1.5">
+                  <div class="max-h-64 overflow-auto">
+                    <div v-if="!promptTemplateStore.isLoaded" class="px-3 py-4 text-center text-xs text-muted-foreground">
+                      {{ t("ai.templateSelectorLoading") }}
+                    </div>
+                    <div v-else-if="promptTemplateStore.templates.length === 0" class="px-3 py-4 text-center text-xs text-muted-foreground">
+                      {{ t("ai.templateSelectorEmpty") }}
+                    </div>
+                    <template v-else>
+                      <template v-for="tpl in promptTemplateStore.templates" :key="tpl.id">
+                        <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-muted" @click="toggleTemplateId(tpl.id)">
+                          <div class="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border" :class="activeTemplateIds.includes(tpl.id) ? 'border-primary bg-primary text-primary-foreground' : ''">
+                            <Check v-if="activeTemplateIds.includes(tpl.id)" class="h-3 w-3" />
                           </div>
-                          <div class="min-w-0 flex-1 text-left">
-                            <div class="flex items-center gap-1">
-                              <span class="truncate font-medium">{{ skill.name }}</span>
-                              <span v-if="duplicateNamesBySource.get(group.source)?.has(skill.name)" class="ai-skill-duplicate-name inline-flex shrink-0 items-center gap-0.5 rounded-sm bg-amber-500/15 px-1 text-[10px] font-normal text-amber-600" :title="t('ai.skillsDuplicateName')">
-                                <AlertTriangle class="h-2.5 w-2.5" />
-                                {{ t("ai.skillsDuplicateName") }}
-                              </span>
+                          <div class="flex-1 truncate text-left">
+                            <div class="flex items-center gap-1 font-medium">
+                              <span class="truncate">{{ tpl.name }}</span>
+                              <Star v-if="isDefaultTemplateForCurrentDb(tpl.id)" class="h-3 w-3 shrink-0 text-amber-500" :title="t('ai.templateDefaultBadgeTitle', { type: currentDbTypeLabel() })" />
                             </div>
-                            <div class="truncate text-[10px] text-muted-foreground">{{ skill.description }}</div>
+                            <div class="text-[10px] text-muted-foreground truncate">{{ tpl.content.slice(0, 60) }}</div>
                           </div>
                         </button>
                       </template>
                     </template>
-                  </template>
-                </div>
-                <div class="border-t mt-1 px-1 pt-1">
-                  <div class="flex gap-1">
-                    <button type="button" class="flex min-w-0 flex-1 items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50" :disabled="!canSelectAllSkills" @click="selectAllSkills">
-                      <Check class="h-3 w-3 shrink-0" />
-                      {{ t("ai.skillsSelectAll") }}
-                    </button>
-                    <button type="button" class="flex min-w-0 flex-1 items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50" :disabled="selectedSkillIds.length === 0" @click="deselectAllSkills">
-                      <X class="h-3 w-3 shrink-0" />
-                      {{ t("ai.skillsDeselectAll") }}
+                  </div>
+                  <div v-if="promptTemplateStore.isLoaded && promptTemplateStore.templates.length > 0" class="border-t mt-1 pt-1 px-1">
+                    <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" @click="deselectAllTemplates">
+                      {{ t("ai.templateSelectorDeselectAll") }}
                     </button>
                   </div>
-                  <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" :disabled="userSkillStore.isLoading" @click="refreshSkills">
-                    <Loader2 v-if="userSkillStore.isLoading" class="h-3 w-3 animate-spin" />
-                    {{ t("ai.skillsRefresh") }}
+                </PopoverContent>
+              </Popover>
+              <!-- Skill selector (read-only user SKILL.md library) -->
+              <Popover v-model:open="skillSelectorOpen">
+                <PopoverTrigger as-child>
+                  <button
+                    type="button"
+                    class="ai-skills-selector-trigger flex shrink-0 items-center gap-1 rounded-[6px] border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+                    :disabled="skillCapabilityUnavailable"
+                    :aria-label="skillSelectorTriggerLabel"
+                    :title="skillSelectorTriggerLabel"
+                  >
+                    <Layers class="h-3 w-3 shrink-0" />
+                    <span class="ai-skills-selector-label truncate">{{ t("ai.skillsEntry") }}</span>
+                    <span v-if="selectedSkillIds.length" class="ai-skills-selector-count rounded-sm bg-primary px-1 text-[10px] font-medium text-primary-foreground">{{ selectedSkillIds.length }}</span>
                   </button>
-                </div>
-              </PopoverContent>
-            </Popover>
+                </PopoverTrigger>
+                <PopoverContent align="end" class="w-72 gap-0 p-1.5">
+                  <div class="max-h-64 overflow-auto">
+                    <div v-if="userSkillStore.isLoading && !userSkillStore.hasLoadedOnce" class="px-3 py-4 text-center text-xs text-muted-foreground">
+                      {{ t("ai.skillsLoading") }}
+                    </div>
+                    <div v-else-if="userSkillStore.lastError" class="space-y-1 px-3 py-4 text-center text-xs text-muted-foreground">
+                      <div>{{ t("ai.skillsLoadError") }}</div>
+                      <button type="button" class="text-[11px] text-primary hover:underline" @click="refreshSkills">
+                        {{ t("ai.skillsRetry") }}
+                      </button>
+                    </div>
+                    <div v-else-if="userSkillStore.totalCount === 0" class="px-3 py-4 text-center text-xs text-muted-foreground">
+                      {{ t("ai.skillsEmpty") }}
+                    </div>
+                    <template v-else>
+                      <template v-for="group in userSkillStore.groupedSkills" :key="group.source">
+                        <div class="px-2 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                          {{ t(group.source === "custom" ? "ai.skillsGroupCustom" : "ai.skillsGroupDefault") }}
+                        </div>
+                        <!-- Same-root name collision: the model addresses skills by name + source,
+                           so it cannot pick between these two, and only changing one of the two
+                           frontmatter `name` values fixes it (the folder name is irrelevant). -->
+                        <div v-if="duplicateNamesBySource.get(group.source)?.size" class="ai-skill-duplicate-note mx-2 mb-1 rounded-sm bg-amber-500/10 px-2 py-1 text-[10px] leading-snug text-amber-600">
+                          {{ t("ai.skillsDuplicateNameNote") }}
+                        </div>
+                        <template v-for="skill in group.skills" :key="skill.id">
+                          <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-muted" :aria-pressed="selectedSkillIds.includes(skill.id)" @click="toggleSkillSelected(skill.id)">
+                            <div class="flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border" :class="selectedSkillIds.includes(skill.id) ? 'border-primary bg-primary text-primary-foreground' : ''">
+                              <Check v-if="selectedSkillIds.includes(skill.id)" class="h-3 w-3" />
+                            </div>
+                            <div class="min-w-0 flex-1 text-left">
+                              <div class="flex items-center gap-1">
+                                <span class="truncate font-medium">{{ skill.name }}</span>
+                                <span v-if="duplicateNamesBySource.get(group.source)?.has(skill.name)" class="ai-skill-duplicate-name inline-flex shrink-0 items-center gap-0.5 rounded-sm bg-amber-500/15 px-1 text-[10px] font-normal text-amber-600" :title="t('ai.skillsDuplicateName')">
+                                  <AlertTriangle class="h-2.5 w-2.5" />
+                                  {{ t("ai.skillsDuplicateName") }}
+                                </span>
+                              </div>
+                              <div class="truncate text-[10px] text-muted-foreground">{{ skill.description }}</div>
+                            </div>
+                          </button>
+                        </template>
+                      </template>
+                    </template>
+                  </div>
+                  <div class="border-t mt-1 px-1 pt-1">
+                    <div class="flex gap-1">
+                      <button type="button" class="flex min-w-0 flex-1 items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50" :disabled="!canSelectAllSkills" @click="selectAllSkills">
+                        <Check class="h-3 w-3 shrink-0" />
+                        {{ t("ai.skillsSelectAll") }}
+                      </button>
+                      <button type="button" class="flex min-w-0 flex-1 items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50" :disabled="selectedSkillIds.length === 0" @click="deselectAllSkills">
+                        <X class="h-3 w-3 shrink-0" />
+                        {{ t("ai.skillsDeselectAll") }}
+                      </button>
+                    </div>
+                    <button type="button" class="flex w-full items-center gap-2 rounded-sm px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground" :disabled="userSkillStore.isLoading" @click="refreshSkills">
+                      <Loader2 v-if="userSkillStore.isLoading" class="h-3 w-3 animate-spin" />
+                      {{ t("ai.skillsRefresh") }}
+                    </button>
+                  </div>
+                </PopoverContent>
+              </Popover>
+            </div>
           </div>
           <div v-if="mentionOpen" class="absolute bottom-full left-2 right-2 z-20 mb-1 max-h-56 overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md">
             <div v-if="mentionLoading" class="flex items-center gap-2 px-2 py-2 text-xs text-muted-foreground">
@@ -7346,31 +7658,62 @@ async function openExternalUrl(url: string) {
           <!-- Req 13: a chip has two states (idle / loaded in this conversation)
                and clicking its body force-loads the skill. Removal therefore needs
                its own control — one button cannot both load and remove. -->
-          <div v-if="selectedSkillChips.length" class="mb-1.5 flex flex-wrap gap-1">
-            <span v-for="chip in selectedSkillChips" :key="chip.id" class="inline-flex max-w-full items-center rounded border bg-muted/60 text-[11px] text-foreground/90" :class="chip.unavailable ? 'border-destructive/50 text-destructive' : chip.loaded ? 'border-emerald-500/60' : 'border-border/80'">
+          <div v-if="selectedSkillChips.length" class="mb-1.5 flex flex-wrap items-center gap-1">
+            <template v-if="selectedSkillsCollapsed">
               <button
                 type="button"
-                class="ai-skill-chip flex min-w-0 items-center gap-1 py-0.5 pl-1.5 pr-1 hover:bg-muted disabled:cursor-not-allowed"
-                :disabled="skillCapabilityUnavailable || chip.loaded"
-                :title="chip.loaded ? t('ai.skillsLoadedState') : skillCapabilityUnavailable ? t('ai.skillsUnsupportedForCliProvider') : t('ai.skillsPreload')"
-                @click="preloadSkill(chip.id)"
+                class="ai-skills-expand-toggle inline-flex max-w-full items-center gap-1.5 rounded border border-border/80 bg-muted/60 px-2 py-0.5 text-[11px] text-foreground/90 hover:bg-muted"
+                :title="t('ai.skillsExpand')"
+                :aria-label="t('ai.skillsExpand')"
+                @click="selectedSkillsCollapsed = false"
               >
-                <Loader2 v-if="skillPreloadPending.includes(chip.id)" class="h-3 w-3 shrink-0 animate-spin" />
-                <Check v-else-if="chip.loaded" class="h-3 w-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
-                <AlertTriangle v-else-if="chip.unavailable" class="h-3 w-3 shrink-0" />
-                <Layers v-else class="h-3 w-3 shrink-0 text-primary" />
-                <span class="truncate" :title="chip.description || chip.name">{{ chip.name }}</span>
-                <span class="shrink-0 text-[9px] text-muted-foreground">{{ t(chip.source === "custom" ? "ai.skillsGroupCustom" : "ai.skillsGroupDefault") }}</span>
-                <span v-if="chip.loaded" class="shrink-0 text-[9px] font-medium text-emerald-600 dark:text-emerald-400">{{ t("ai.skillsLoadedState") }}</span>
+                <Layers class="h-3 w-3 shrink-0 text-primary" />
+                <span class="truncate font-medium">{{ t("ai.skillsSelectedCount", { count: selectedSkillChips.length }) }}</span>
+                <span v-if="loadedSelectedSkillsCount > 0" class="shrink-0 text-[9px] font-medium text-emerald-600 dark:text-emerald-400"> ({{ loadedSelectedSkillsCount }}/{{ selectedSkillChips.length }} {{ t("ai.skillsLoadedState") }}) </span>
+                <ChevronDown class="h-3 w-3 shrink-0 text-muted-foreground" />
               </button>
-              <button type="button" class="ai-skill-chip-remove shrink-0 py-0.5 pl-0.5 pr-1.5 hover:text-destructive" :aria-label="t('common.remove')" :title="t('common.remove')" @click="removeSelectedSkill(chip.id)">
-                <X class="h-3 w-3 shrink-0" />
+            </template>
+            <template v-else>
+              <span
+                v-for="chip in selectedSkillChips"
+                :key="chip.id"
+                class="inline-flex max-w-full items-center rounded border bg-muted/60 text-[11px] text-foreground/90"
+                :class="chip.unavailable ? 'border-destructive/50 text-destructive' : chip.loaded ? 'border-emerald-500/60' : 'border-border/80'"
+              >
+                <button
+                  type="button"
+                  class="ai-skill-chip flex min-w-0 items-center gap-1 py-0.5 pl-1.5 pr-1 hover:bg-muted disabled:cursor-not-allowed"
+                  :disabled="skillCapabilityUnavailable || chip.loaded"
+                  :title="chip.loaded ? t('ai.skillsLoadedState') : skillCapabilityUnavailable ? t('ai.skillsUnsupportedForCliProvider') : t('ai.skillsPreload')"
+                  @click="preloadSkill(chip.id)"
+                >
+                  <Loader2 v-if="skillPreloadPending.includes(chip.id)" class="h-3 w-3 shrink-0 animate-spin" />
+                  <Check v-else-if="chip.loaded" class="h-3 w-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                  <AlertTriangle v-else-if="chip.unavailable" class="h-3 w-3 shrink-0" />
+                  <Layers v-else class="h-3 w-3 shrink-0 text-primary" />
+                  <span class="truncate" :title="chip.description || chip.name">{{ chip.name }}</span>
+                  <span class="shrink-0 text-[9px] text-muted-foreground">{{ t(chip.source === "custom" ? "ai.skillsGroupCustom" : "ai.skillsGroupDefault") }}</span>
+                  <span v-if="chip.loaded" class="shrink-0 text-[9px] font-medium text-emerald-600 dark:text-emerald-400">{{ t("ai.skillsLoadedState") }}</span>
+                </button>
+                <button type="button" class="ai-skill-chip-remove shrink-0 py-0.5 pl-0.5 pr-1.5 hover:text-destructive" :aria-label="t('common.remove')" :title="t('common.remove')" @click="removeSelectedSkill(chip.id)">
+                  <X class="h-3 w-3 shrink-0" />
+                </button>
+              </span>
+              <button
+                type="button"
+                class="ai-skills-collapse-toggle inline-flex items-center gap-1 rounded border border-border/80 bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                :title="t('ai.skillsCollapse')"
+                :aria-label="t('ai.skillsCollapse')"
+                @click="selectedSkillsCollapsed = true"
+              >
+                <ChevronUp class="h-3 w-3 shrink-0" />
+                <span>{{ t("ai.skillsCollapse") }}</span>
               </button>
-            </span>
+            </template>
           </div>
           <!-- Req 14: one one-time hint per conversation while nothing selected has
                been loaded yet. Clicking it is the same force-load as the chip. -->
-          <div v-if="showSkillHint" class="mb-1.5">
+          <div v-if="showSkillHint && !selectedSkillsCollapsed" class="mb-1.5">
             <button type="button" class="ai-skill-hint inline-flex max-w-full items-center gap-1 rounded border border-primary/40 bg-primary/5 px-1.5 py-0.5 text-left text-[11px] text-primary hover:bg-primary/10" :title="t('ai.skillsPreload')" @click="preloadHintedSkill">
               <Sparkles class="h-3 w-3 shrink-0" />
               <span class="truncate">{{ skillHintText }}</span>
@@ -7590,20 +7933,31 @@ async function openExternalUrl(url: string) {
                           {{ modelSearchQuery.trim() ? t("ai.noModelMatch") : t("ai.noModels") }}
                         </div>
                         <template v-if="getConfigModelOptions(config).length">
-                          <button
+                          <div
                             v-for="model in getConfigModelOptions(config)"
                             :key="model.id"
-                            type="button"
-                            class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+                            class="group/model flex w-full items-center gap-1.5 rounded-sm px-2 py-1 text-left text-xs hover:bg-accent hover:text-accent-foreground"
                             :class="model.id === settings.activeModel?.modelId && config.id === settings.activeModel?.configId ? 'bg-accent text-accent-foreground' : ''"
-                            @click="handleModelSelect(config.id, model.id)"
                           >
-                            <span class="min-w-0 flex-1 truncate">
-                              {{ model.displayName || model.id }}
-                              <span v-if="model.displayName && model.displayName !== model.id" class="ml-1 text-[10px] text-muted-foreground">{{ model.id }}</span>
-                            </span>
-                            <Check v-if="model.id === settings.activeModel?.modelId && config.id === settings.activeModel?.configId" class="h-3.5 w-3.5 shrink-0 text-primary" />
-                          </button>
+                            <button type="button" class="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left" :data-model-id="model.id" @click="handleModelSelect(config.id, model.id)">
+                              <span class="min-w-0 flex-1 truncate">
+                                {{ model.displayName || model.id }}
+                                <span v-if="model.displayName && model.displayName !== model.id" class="ml-1 text-[10px] text-muted-foreground">{{ model.id }}</span>
+                              </span>
+                              <Check v-if="model.id === settings.activeModel?.modelId && config.id === settings.activeModel?.configId" class="h-3.5 w-3.5 shrink-0 text-primary" />
+                            </button>
+                            <button
+                              v-if="canRemoveModel(config, model.id)"
+                              type="button"
+                              class="rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover/model:opacity-100"
+                              :title="t('common.delete')"
+                              :aria-label="t('common.delete')"
+                              :data-remove-model="model.id"
+                              @click.stop="handleRemoveModel(config.id, model.id)"
+                            >
+                              <X class="h-3 w-3 shrink-0" />
+                            </button>
+                          </div>
                         </template>
                         <div v-if="getModelCatalog(config.id).status === 'error' && getModelsForConfig(config.id).length" class="flex items-center justify-between gap-2 px-2 py-1 text-[10px] text-muted-foreground">
                           <span class="truncate" :title="getModelCatalog(config.id).error">{{ t("ai.modelLoadFailed") }}</span>
@@ -7812,8 +8166,7 @@ async function openExternalUrl(url: string) {
 }
 
 .ai-prompt-context-row--compact .ai-template-selector-trigger,
-.ai-prompt-context-row--compact .ai-skills-selector-trigger,
-.ai-prompt-context-row--compact .ai-database-selector-trigger {
+.ai-prompt-context-row--compact .ai-skills-selector-trigger {
   flex: 0 0 1.5rem;
   width: 1.5rem;
   max-width: 1.5rem;
@@ -7825,8 +8178,7 @@ async function openExternalUrl(url: string) {
 .ai-prompt-context-row--compact .ai-template-selector-label,
 .ai-prompt-context-row--compact .ai-template-selector-chevron,
 .ai-prompt-context-row--compact .ai-skills-selector-label,
-.ai-prompt-context-row--compact .ai-skills-selector-count,
-.ai-prompt-context-row--compact .ai-database-selector-trigger > span {
+.ai-prompt-context-row--compact .ai-skills-selector-count {
   display: none;
 }
 
@@ -7926,7 +8278,7 @@ async function openExternalUrl(url: string) {
   background: var(--muted);
   padding: 0.125rem 0.375rem;
   font-size: var(--dbx-ai-inline-code-font-size, 11px);
-  font-family: ui-monospace, monospace;
+  font-family: var(--dbx-ai-content-font-family, ui-monospace, monospace);
 }
 .ai-markdown :deep(pre) {
   background: var(--muted);
@@ -7938,6 +8290,7 @@ async function openExternalUrl(url: string) {
 .ai-markdown :deep(pre code) {
   background: none;
   padding: 0;
+  font-family: ui-monospace, monospace;
 }
 .ai-markdown :deep(table) {
   border-collapse: collapse;

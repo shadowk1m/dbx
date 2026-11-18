@@ -12,7 +12,7 @@ import {
   buildTruncateTableSql,
   buildVacuumTableSql,
   supportsDropTableCascade,
-  supportsNativeMysqlAutoIncrement,
+  supportsMysqlAutoIncrement,
   supportsTruncateTableCascade,
   type MysqlAutoIncrementSqlOptions,
   type TableAdminSqlOptions,
@@ -74,7 +74,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
   });
   const canDropTableCascade = computed(() => activeNode.value.type === "table" && supportsDropTableCascade(currentDatabaseType()));
   const canTruncateTableCascade = computed(() => activeNode.value.type === "table" && supportsTruncateTableCascade(currentDatabaseType()));
-  const supportsMysqlAutoIncrement = computed(() => activeNode.value.type === "table" && supportsNativeMysqlAutoIncrement(activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined));
+  const supportsMysqlAutoIncrementAction = computed(() => activeNode.value.type === "table" && supportsMysqlAutoIncrement(activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined));
 
   function tableAdminSqlOptions(optionsOverride?: { cascade?: boolean }): TableAdminSqlOptions {
     const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
@@ -87,6 +87,8 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
       identifierQuote: connectionStore.connectionIdentifierQuote?.(activeNode.value.connectionId),
     };
     if (optionsOverride?.cascade) result.cascade = true;
+    // PostgreSQL needs `DROP FOREIGN TABLE` for relkind = 'f' (#14717).
+    if (activeNode.value.tableType?.toUpperCase() === "FOREIGN TABLE") result.foreignTable = true;
     return result;
   }
 
@@ -99,6 +101,8 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
       identifierQuote: connectionStore.connectionIdentifierQuote?.(node.connectionId),
     };
     if (optionsOverride?.cascade) result.cascade = true;
+    // PostgreSQL needs `DROP FOREIGN TABLE` for relkind = 'f' (#14717).
+    if (node.tableType?.toUpperCase() === "FOREIGN TABLE") result.foreignTable = true;
     return result;
   }
 
@@ -153,7 +157,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
   }
 
   function mysqlAutoIncrement() {
-    if (!supportsMysqlAutoIncrement.value) return;
+    if (!supportsMysqlAutoIncrementAction.value) return;
     mysqlAutoIncrementValue.value = "1";
     mysqlAutoIncrementPreviewKey.value = "";
     void refreshMysqlAutoIncrementPreviewSql();
@@ -165,7 +169,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
     if (!node.connectionId || !node.database) return;
     try {
       const config = connectionStore.getConfig(node.connectionId);
-      if (!supportsNativeMysqlAutoIncrement(config)) throw new Error("Setting AUTO_INCREMENT is supported only for native MySQL connections.");
+      if (!supportsMysqlAutoIncrement(config)) throw new Error("Setting AUTO_INCREMENT is supported only for compatible MySQL-family connections.");
       await connectionStore.ensureConnected(node.connectionId);
       const sqlOptions = mysqlAutoIncrementSqlOptionsForNode(node);
       const previewKey = mysqlAutoIncrementPreviewKeyForNode(node, sqlOptions);
@@ -174,7 +178,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
       toast(t("contextMenu.mysqlAutoIncrementSuccess", { name: node.label, value: mysqlAutoIncrementValue.value }), 3000);
       await options.refreshMutatedTableDataTabsForNode(node);
     } catch (error: any) {
-      toast(t("contextMenu.tableOperationFailed", { message: error?.message || String(error) }), 5000);
+      toast(t("contextMenu.tableOperationFailed", { message: error?.message || String(error) }), { persistent: true });
     }
   }
 
@@ -230,7 +234,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
       toast(t("contextMenu.vacuumTableSuccess", { name: node.label }), 3000);
       return true;
     } catch (error: any) {
-      toast(t("contextMenu.tableOperationFailed", { message: error?.message || String(error) }), 5000);
+      toast(t("contextMenu.tableOperationFailed", { message: error?.message || String(error) }), { persistent: true });
       return false;
     } finally {
       vacuumTableExecuting.value = false;
@@ -442,11 +446,11 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
     if (cancelConfirmed) {
       toast(t("contextMenu.tableOperationCancelled", { name }), 3000);
     } else if (wasCancelled) {
-      toast(t("contextMenu.tableOperationCancelUnconfirmed", { name, message }), 8000);
+      toast(t("contextMenu.tableOperationCancelUnconfirmed", { name, message }), { persistent: true });
     } else if (isQueryTimeoutErrorMessage(message, backendError)) {
-      toast(t("contextMenu.tableOperationTimedOut", { name, message }), 8000);
+      toast(t("contextMenu.tableOperationTimedOut", { name, message }), { persistent: true });
     } else {
-      toast(t("contextMenu.tableOperationFailed", { message }), 5000);
+      toast(t("contextMenu.tableOperationFailed", { message }), { persistent: true });
     }
   }
 
@@ -571,7 +575,7 @@ export function useSidebarTableMutationRuntime(options: SidebarTableMutationRunt
     supportsVacuum,
     canDropTableCascade,
     canTruncateTableCascade,
-    supportsMysqlAutoIncrement,
+    supportsMysqlAutoIncrement: supportsMysqlAutoIncrementAction,
     refreshDropTablePreviewSql,
     refreshTruncateTablePreviewSql,
     dropTable,

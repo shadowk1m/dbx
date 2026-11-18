@@ -20,10 +20,23 @@ use crate::table_structure_sql::{
     build_sqlserver_drop_default_constraint_sql, build_sqlserver_table_comment_sql, sqlserver_unicode_string_literal,
 };
 use crate::types::{
-    ColumnInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, OwnerInfo, RuleInfo, SequenceInfo, TableInfo, TriggerInfo,
+    ColumnInfo, ForeignKeyInfo, FunctionInfo, IndexInfo, ObjectSourceKind, OwnerInfo, RuleInfo, SequenceInfo,
+    TableInfo, TriggerInfo,
 };
 
+mod mysql_charset;
+mod mysql_defaults;
+pub use mysql_charset::{MysqlTableCharset, TableCharsetDiff};
+mod oracle_indexes;
+mod oracle_routines;
 mod sqlserver_dependencies;
+pub use oracle_indexes::{
+    OracleSchemaSyncDdlOptions, OracleSchemaSyncDdlSources, OracleSchemaSyncEndpoint, OracleSchemaSyncTableDdl,
+    SchemaSyncGenerationIssue,
+};
+pub use oracle_routines::{
+    diff_oracle_routines, oracle_routine_diff_sql, OracleRoutineCompareContext, OracleRoutineCompareIdentity,
+};
 
 use sqlserver_dependencies::build_dependency_aware_alter_column_batch;
 
@@ -166,6 +179,8 @@ pub struct FunctionDiff {
     #[serde(rename = "type")]
     pub diff_type: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_kind: Option<ObjectSourceKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<FunctionInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,6 +259,8 @@ pub struct TableDiff {
     pub source_table_comment: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_table_comment: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_charset: Option<TableCharsetDiff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_sql: Option<String>,
 }
@@ -498,6 +515,8 @@ pub struct SchemaDiffPreparationOptions {
     pub source_functions: Vec<FunctionInfo>,
     #[serde(default)]
     pub target_functions: Vec<FunctionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_routines: Option<OracleRoutineCompareContext>,
     #[serde(default)]
     pub source_sequences: Vec<SequenceInfo>,
     #[serde(default)]
@@ -625,6 +644,10 @@ pub struct SchemaDiffPreparation {
 #[serde(rename_all = "camelCase")]
 pub struct SchemaSyncSqlPlan {
     pub sync_sql: String,
+    #[serde(default = "default_rollback_complete")]
+    pub forward_completeness: RollbackCompleteness,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generation_issues: Vec<SchemaSyncGenerationIssue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback_sync_sql: Option<String>,
     pub rollback_completeness: RollbackCompleteness,
@@ -1552,6 +1575,7 @@ impl RollbackGraph {
             target_ddl: if recreates_removed_table { diff.target_ddl.clone() } else { diff.ddl.clone() },
             source_table_comment: source_comment,
             target_table_comment: target_comment,
+            table_charset: diff.table_charset.as_ref().map(TableCharsetDiff::inverted),
             sync_sql: None,
         }
     }
@@ -1613,7 +1637,19 @@ pub fn generate_rollback_sync_sql_with_missing(
     cascade_delete: bool,
 ) -> (String, Vec<MissingRollbackObject>) {
     let rollback_diffs: Vec<TableDiff> = rollback_graph.rollback_nodes.iter().map(|n| n.table_diff.clone()).collect();
-    generate_schema_sync_sql_inner(&rollback_diffs, &[], &[], &[], &[], db_type, schema, cascade_delete, None, &[])
+    generate_schema_sync_sql_inner(
+        &rollback_diffs,
+        &[],
+        &[],
+        &[],
+        &[],
+        db_type,
+        schema,
+        cascade_delete,
+        None,
+        &[],
+        true,
+    )
 }
 
 // ============================================================================
@@ -1989,6 +2025,7 @@ impl Default for SchemaDiffPreparationOptions {
             target_details: Vec::new(),
             source_functions: Vec::new(),
             target_functions: Vec::new(),
+            oracle_routines: None,
             source_sequences: Vec::new(),
             target_sequences: Vec::new(),
             source_rules: Vec::new(),
@@ -2143,6 +2180,7 @@ pub fn prepare_schema_diff(options: SchemaDiffPreparationOptions) -> SchemaDiffP
                 target_ddl: target_detail.and_then(|d| d.ddl.clone()),
                 source_table_comment: None,
                 target_table_comment: None,
+                table_charset: None,
                 sync_sql: None,
             });
         }
@@ -2191,7 +2229,10 @@ pub fn prepare_schema_diff(options: SchemaDiffPreparationOptions) -> SchemaDiffP
         None
     };
 
-    let function_diffs = diff_functions(&options.source_functions, &options.target_functions);
+    let function_diffs = match &options.oracle_routines {
+        Some(context) => diff_oracle_routines(&options.source_functions, &options.target_functions, context),
+        None => diff_functions(&options.source_functions, &options.target_functions),
+    };
     let sequence_diffs = diff_sequences(&options.source_sequences, &options.target_sequences);
     let rule_diffs = diff_rules(&options.source_rules, &options.target_rules);
     let owner_diffs = diff_owners(&options.source_owners, &options.target_owners);
@@ -2208,15 +2249,16 @@ pub fn prepare_schema_diff(options: SchemaDiffPreparationOptions) -> SchemaDiffP
             options.cascade_delete,
             options.source_dialect,
             &options.field_mappings,
+            options.compare_charset,
         );
         if !sync_sql.is_empty() {
             diff.sync_sql = Some(sync_sql);
         }
     }
 
-    let (sync_sql, _) = generate_schema_sync_sql_inner(
+    let (mut sync_sql, _) = generate_schema_sync_sql_inner(
         &diffs,
-        &function_diffs,
+        if options.oracle_routines.is_some() { &[] } else { &function_diffs },
         &sequence_diffs,
         &rule_diffs,
         &owner_diffs,
@@ -2225,7 +2267,30 @@ pub fn prepare_schema_diff(options: SchemaDiffPreparationOptions) -> SchemaDiffP
         options.cascade_delete,
         options.source_dialect,
         &options.field_mappings,
+        options.compare_charset,
     );
+    if let Some(context) = &options.oracle_routines {
+        for diff in &function_diffs {
+            if diff.diff_type == "removed"
+                && diff.program_kind == Some(ObjectSourceKind::PackageBody)
+                && function_diffs.iter().any(|other| {
+                    other.name == diff.name
+                        && other.diff_type == "removed"
+                        && other.program_kind == Some(ObjectSourceKind::Package)
+                })
+            {
+                continue;
+            }
+            if let Ok(sql) = oracle_routine_diff_sql(diff, context) {
+                if !sql.is_empty() {
+                    if !sync_sql.is_empty() {
+                        sync_sql.push_str("\n\n");
+                    }
+                    sync_sql.push_str(&sql);
+                }
+            }
+        }
+    }
 
     let (rollback_sync_sql, missing_rollback_objects) = match &rollback_graph {
         Some(graph) => {
@@ -2371,6 +2436,17 @@ fn compare_mysql_column_charset(options: &SchemaDiffPreparationOptions) -> bool 
     source_dialect == DialectKind::Mysql && target_dialect == DialectKind::Mysql
 }
 
+/// MySQL-family engines treat `RESTRICT`, `NO ACTION` and an omitted referential action identically,
+/// so they are only folded together when both sides of the comparison use the MySQL dialect.
+/// PostgreSQL, SQL Server, Oracle, SQLite, etc. are deliberately excluded: there `NO ACTION` may be
+/// deferred to the end of the statement/transaction while `RESTRICT` is checked immediately.
+fn mysql_foreign_key_actions(options: &SchemaDiffPreparationOptions) -> bool {
+    let target_dialect =
+        options.target_dialect.unwrap_or_else(|| DialectKind::from_database_type(options.database_type));
+    let source_dialect = options.source_dialect.unwrap_or(target_dialect);
+    source_dialect == DialectKind::Mysql && target_dialect == DialectKind::Mysql
+}
+
 fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
     let source_details: HashMap<&str, &TableSchemaDetail> =
         options.source_details.iter().map(|detail| (detail.name.as_str(), detail)).collect();
@@ -2507,6 +2583,7 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             }),
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         });
     }
@@ -2565,6 +2642,7 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             target_ddl: target_detail.and_then(|detail| detail.ddl.clone()),
             source_table_comment: None,
             target_table_comment: target_table_comments.get(name_clone.as_str()).cloned(),
+            table_charset: None,
             sync_sql: None,
         });
     }
@@ -2584,6 +2662,7 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         });
     }
@@ -2603,6 +2682,7 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             target_ddl: target_details.get(name_clone.as_str()).and_then(|detail| detail.ddl.clone()),
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         });
     }
@@ -2631,6 +2711,7 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             target_ddl: Some(target_ddl.clone()),
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         });
     }
@@ -2675,18 +2756,25 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             &normalized_target_fks,
             options.ignore_table_name_case,
             options.ignore_column_name_case,
+            mysql_foreign_key_actions(options),
         );
         let trigger_diffs = diff_triggers(&source.triggers, &target.triggers);
         let source_comment = source_table_comments.get(name.as_str()).cloned().unwrap_or(None);
         let target_comment = target_table_comments.get(target_name.as_str()).cloned().unwrap_or(None);
         let comment_changed = !options.ignore_comments
             && source_comment.clone().unwrap_or_default() != target_comment.clone().unwrap_or_default();
+        let table_charset = if compare_mysql_column_charset(options) {
+            mysql_charset::compare_table_defaults(source.ddl.as_deref(), target.ddl.as_deref())
+        } else {
+            None
+        };
 
         let has_diff = !column_diffs.is_empty()
             || !index_diffs.is_empty()
             || !foreign_key_diffs.is_empty()
             || !trigger_diffs.is_empty()
-            || comment_changed;
+            || comment_changed
+            || table_charset.is_some();
 
         result.push(TableDiff {
             diff_type: if has_diff { "modified".to_string() } else { "none".to_string() },
@@ -2701,6 +2789,7 @@ fn diff_schema(options: &SchemaDiffPreparationOptions) -> Vec<TableDiff> {
             target_ddl: target.ddl.clone(),
             source_table_comment: if has_diff { comment_changed.then_some(source_comment) } else { None },
             target_table_comment: if has_diff { comment_changed.then_some(target_comment) } else { None },
+            table_charset,
             sync_sql: None,
         });
     }
@@ -3210,6 +3299,20 @@ fn parse_mysql_integer_type(data_type: &str) -> MysqlIntegerTypeSignature {
     MysqlIntegerTypeSignature { normalized, integer_key, width }
 }
 
+/// PostgreSQL's time types default to precision 6, but `format_type()` only prints the
+/// precision when it was declared: `timestamp` and `timestamp(6)` are the same column type
+/// yet render differently. Dropping an explicit `(6)` lets both spellings compare equal,
+/// while any other explicit precision (e.g. `timestamp(3)`) is still a real difference.
+fn normalize_postgres_temporal_type(data_type: &str) -> String {
+    let normalized = data_type.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+    let base = normalized.split(['(', ' ', '[']).next().unwrap_or_default();
+    if matches!(base, "timestamp" | "timestamptz" | "time" | "timetz" | "interval") {
+        normalized.replacen("(6)", "", 1)
+    } else {
+        normalized
+    }
+}
+
 fn column_types_equal_for_dialects(
     source_type: &str,
     target_type: &str,
@@ -3231,6 +3334,9 @@ fn column_types_equal_for_dialects(
             return true;
         }
         _ => {}
+    }
+    if source_dialect == Some(DialectKind::Postgres) && target_dialect == Some(DialectKind::Postgres) {
+        return normalize_postgres_temporal_type(source_type) == normalize_postgres_temporal_type(target_type);
     }
     if source_dialect != Some(DialectKind::Mysql) || target_dialect != Some(DialectKind::Mysql) {
         return false;
@@ -3779,6 +3885,30 @@ fn normalized_foreign_key_action(action: Option<&str>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Normalizes a referential action for comparison. With `mysql_actions`, InnoDB semantics apply:
+/// `RESTRICT`, `NO ACTION` and an omitted clause (which MySQL reports as `NO ACTION`) all reject
+/// the change immediately, so they collapse to one value and never surface as a difference.
+///
+/// References (MySQL 8.4 Reference Manual, 15.1.20.5 "FOREIGN KEY Constraints"):
+/// - "NO ACTION: ... For InnoDB, this is equivalent to RESTRICT".
+/// - "Specifying RESTRICT (or NO ACTION) is the same as omitting the ON DELETE or ON UPDATE clause."
+/// - "For an ON DELETE or ON UPDATE that is not specified, the default action is always NO ACTION."
+///   MariaDB KB "Foreign Keys" likewise documents `NO ACTION` as a "Synonym for RESTRICT".
+///
+/// Only the comparison is normalized; generated DDL keeps the source's original action text.
+/// Known caveat: on MySQL NDB Cluster `NO ACTION` is a deferred check, but schema metadata does
+/// not carry the storage engine, and NDB foreign keys are rare enough that InnoDB semantics win.
+fn comparable_foreign_key_action(action: Option<&str>, mysql_actions: bool) -> Option<String> {
+    let normalized = normalized_foreign_key_action(action);
+    if !mysql_actions {
+        return normalized;
+    }
+    match normalized.as_deref() {
+        None | Some("RESTRICT" | "NO ACTION") => Some("NO ACTION".to_string()),
+        _ => normalized,
+    }
+}
+
 fn normalize_self_referencing_fk(
     fk: &ForeignKeyInfo,
     own_table_names: &HashSet<&str>,
@@ -3824,7 +3954,7 @@ fn normalize_mapped_foreign_key(
 }
 
 pub fn diff_foreign_keys(source: &[ForeignKeyInfo], target: &[ForeignKeyInfo]) -> Vec<ForeignKeyDiff> {
-    diff_foreign_keys_with_options(source, target, false, false)
+    diff_foreign_keys_with_options(source, target, false, false, false)
 }
 
 fn diff_foreign_keys_with_options(
@@ -3832,6 +3962,7 @@ fn diff_foreign_keys_with_options(
     target: &[ForeignKeyInfo],
     ignore_table_name_case: bool,
     ignore_column_name_case: bool,
+    mysql_actions: bool,
 ) -> Vec<ForeignKeyDiff> {
     let source = group_foreign_keys(source);
     let target = group_foreign_keys(target);
@@ -3851,8 +3982,14 @@ fn diff_foreign_keys_with_options(
             target.iter().enumerate().find_map(|(index, target_fk)| {
                 (!matched[index]
                     && target_fk.name.is_empty()
-                    && foreign_key_changes(source_fk, target_fk, ignore_table_name_case, ignore_column_name_case)
-                        .is_empty())
+                    && foreign_key_changes(
+                        source_fk,
+                        target_fk,
+                        ignore_table_name_case,
+                        ignore_column_name_case,
+                        mysql_actions,
+                    )
+                    .is_empty())
                 .then_some(index)
             })
         } else {
@@ -3870,7 +4007,8 @@ fn diff_foreign_keys_with_options(
         };
         matched[target_index] = true;
         let target_fk = &target[target_index];
-        let changes = foreign_key_changes(source_fk, target_fk, ignore_table_name_case, ignore_column_name_case);
+        let changes =
+            foreign_key_changes(source_fk, target_fk, ignore_table_name_case, ignore_column_name_case, mysql_actions);
         if !changes.is_empty() {
             diffs.push(ForeignKeyDiff {
                 diff_type: "modified".to_string(),
@@ -3902,6 +4040,7 @@ fn foreign_key_changes(
     target_fk: &SchemaForeignKeyInfo,
     ignore_table_name_case: bool,
     ignore_column_name_case: bool,
+    mysql_actions: bool,
 ) -> Vec<String> {
     let mut changes = Vec::new();
     if source_fk.columns().len() != target_fk.columns().len()
@@ -3932,8 +4071,8 @@ fn foreign_key_changes(
     {
         changes.push(format!("ref column: {} → {}", target_fk.ref_column, source_fk.ref_column));
     }
-    let source_on_delete = normalized_foreign_key_action(source_fk.on_delete.as_deref());
-    let target_on_delete = normalized_foreign_key_action(target_fk.on_delete.as_deref());
+    let source_on_delete = comparable_foreign_key_action(source_fk.on_delete.as_deref(), mysql_actions);
+    let target_on_delete = comparable_foreign_key_action(target_fk.on_delete.as_deref(), mysql_actions);
     if source_on_delete != target_on_delete {
         changes.push(format!(
             "delete: {} → {}",
@@ -3941,8 +4080,8 @@ fn foreign_key_changes(
             source_on_delete.as_deref().unwrap_or("")
         ));
     }
-    let source_on_update = normalized_foreign_key_action(source_fk.on_update.as_deref());
-    let target_on_update = normalized_foreign_key_action(target_fk.on_update.as_deref());
+    let source_on_update = comparable_foreign_key_action(source_fk.on_update.as_deref(), mysql_actions);
+    let target_on_update = comparable_foreign_key_action(target_fk.on_update.as_deref(), mysql_actions);
     if source_on_update != target_on_update {
         changes.push(format!(
             "update: {} → {}",
@@ -4030,6 +4169,7 @@ pub fn diff_functions(source: &[FunctionInfo], target: &[FunctionInfo]) -> Vec<F
         let Some(target_fn) = target_map.get(&key) else {
             diffs.push(FunctionDiff {
                 diff_type: "added".to_string(),
+                program_kind: None,
                 name: source_fn.name.clone(),
                 source: Some(source_fn.clone()),
                 target: None,
@@ -4051,6 +4191,7 @@ pub fn diff_functions(source: &[FunctionInfo], target: &[FunctionInfo]) -> Vec<F
         if !changes.is_empty() {
             diffs.push(FunctionDiff {
                 diff_type: "modified".to_string(),
+                program_kind: None,
                 name: source_fn.name.clone(),
                 source: Some(source_fn.clone()),
                 target: Some((*target_fn).clone()),
@@ -4064,6 +4205,7 @@ pub fn diff_functions(source: &[FunctionInfo], target: &[FunctionInfo]) -> Vec<F
         if !source_map.contains_key(&key) {
             diffs.push(FunctionDiff {
                 diff_type: "removed".to_string(),
+                program_kind: None,
                 name: target_fn.name.clone(),
                 source: None,
                 target: Some(target_fn.clone()),
@@ -4262,6 +4404,20 @@ fn column_def(col: &ColumnInfo, db_type: DatabaseType, source_dialect: Option<Di
     column_def_with_charset(col, db_type, source_dialect, false)
 }
 
+fn kingbase_generation_clause(
+    col: &ColumnInfo,
+    db_type: DatabaseType,
+    source_dialect: Option<DialectKind>,
+) -> Option<&str> {
+    if db_type != DatabaseType::Kingbase || !matches!(source_dialect, None | Some(DialectKind::Postgres)) {
+        return None;
+    }
+    col.extra.as_deref().map(str::trim).filter(|extra| {
+        let normalized = extra.to_ascii_lowercase();
+        normalized.starts_with("generated ") || normalized == "identity" || normalized.starts_with("identity(")
+    })
+}
+
 fn column_def_with_charset(
     col: &ColumnInfo,
     db_type: DatabaseType,
@@ -4273,7 +4429,10 @@ fn column_def_with_charset(
     }
     let profile = profile_for(db_type);
     let mut definition = format!("{} {}", quote_id(&col.name, db_type), col.data_type);
-    if include_charset && matches!(db_type, DatabaseType::Mysql | DatabaseType::Goldendb) {
+    if include_charset
+        && matches!(db_type, DatabaseType::Mysql | DatabaseType::Goldendb)
+        && mysql_charset::supports_charset(&col.data_type)
+    {
         if let Some(character_set) = mysql_charset_value(col.character_set.as_deref()) {
             definition.push_str(&format!(" CHARACTER SET {}", quote_id(character_set, db_type)));
         }
@@ -4281,7 +4440,18 @@ fn column_def_with_charset(
             definition.push_str(&format!(" COLLATE {}", quote_id(collation, db_type)));
         }
     }
-    definition.push_str(&column_modifier_tail(&profile, col, &col.data_type, db_type, source_dialect, false));
+    let generation = kingbase_generation_clause(col, db_type, source_dialect);
+    if let Some(clause) = generation {
+        definition.push_str(&format!(" {clause}"));
+    }
+    definition.push_str(&column_modifier_tail(
+        &profile,
+        col,
+        &col.data_type,
+        db_type,
+        source_dialect,
+        generation.is_some(),
+    ));
     // Suffix-style auto-increment is only valid in MySQL-family ALTER clauses
     // (ADD/MODIFY/CHANGE). Other dialects' identity clauses are order-sensitive
     // inside ADD COLUMN, so keep omitting them outside the MySQL family.
@@ -4352,19 +4522,7 @@ fn starts_with_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
 /// database) is left untouched, since it already resolves correctly wherever
 /// the sync script runs.
 fn rewrite_ddl_header_qualifier(ddl: &str, header_keywords: &[&str], schema: Option<&str>, qualified: &str) -> String {
-    let leading_ws = ddl.len() - ddl.trim_start().len();
-    let body = &ddl[leading_ws..];
-    let Some(keyword) = header_keywords.iter().find(|keyword| starts_with_ignore_ascii_case(body, keyword)) else {
-        return ddl.to_string();
-    };
-
-    let mut idx = skip_ascii_whitespace(ddl, leading_ws + keyword.len());
-    if starts_with_ignore_ascii_case(&ddl[idx..], "IF NOT EXISTS") {
-        idx = skip_ascii_whitespace(ddl, idx + "IF NOT EXISTS".len());
-    }
-
-    let ident_start = idx;
-    let Some(parsed) = parse_qualified_identifier(ddl, idx) else {
+    let Some((ident_start, parsed)) = parse_ddl_header_name(ddl, header_keywords) else {
         return ddl.to_string();
     };
     let Some((schema_start, schema_end)) = parsed.schema_span else {
@@ -4380,6 +4538,90 @@ fn rewrite_ddl_header_qualifier(ddl: &str, header_keywords: &[&str], schema: Opt
         return ddl.to_string();
     }
     format!("{}{}{}", &ddl[..ident_start], qualified, &ddl[parsed.end..])
+}
+
+/// Locates the object name that follows one of `header_keywords` at the start
+/// of `ddl`, returning its start offset and parsed span.
+fn parse_ddl_header_name(ddl: &str, header_keywords: &[&str]) -> Option<(usize, ParsedDdlName)> {
+    let leading_ws = ddl.len() - ddl.trim_start().len();
+    let body = &ddl[leading_ws..];
+    let keyword = header_keywords.iter().find(|keyword| starts_with_ignore_ascii_case(body, keyword))?;
+
+    let mut idx = skip_ascii_whitespace(ddl, leading_ws + keyword.len());
+    if starts_with_ignore_ascii_case(&ddl[idx..], "IF NOT EXISTS") {
+        idx = skip_ascii_whitespace(ddl, idx + "IF NOT EXISTS".len());
+    }
+    parse_qualified_identifier(ddl, idx).map(|parsed| (idx, parsed))
+}
+
+/// Oracle's native table DDL qualifies more than its `CREATE TABLE` head with
+/// the source schema: foreign key `REFERENCES`, and the `CREATE INDEX` and
+/// `COMMENT ON` statements the agent appends. Rewriting only the head left
+/// those pointing at the source schema, so the sync script failed on the target
+/// or ran them against the source schema (#12048).
+/// After the head rewrite, every `"SOURCE".` qualifier in code is moved to the
+/// target schema. References to other schemas, string literals, and comments
+/// keep their text.
+fn rewrite_oracle_native_table_ddl(ddl: &str, schema: Option<&str>, qualified: &str) -> String {
+    let source_schema = parse_ddl_header_name(ddl, TABLE_DDL_HEADER_KEYWORDS)
+        .and_then(|(_, parsed)| parsed.schema_span)
+        .map(|(start, end)| strip_identifier_quotes(&ddl[start..end]));
+    let rewritten = rewrite_ddl_header_qualifier(ddl, TABLE_DDL_HEADER_KEYWORDS, schema, qualified);
+    let target_schema = schema.map(str::trim).filter(|schema| !schema.is_empty());
+    match (source_schema, target_schema) {
+        (Some(source), Some(target)) if source != target => {
+            rewrite_quoted_schema_qualifier(&rewritten, &source, &quote_id(target, DatabaseType::Oracle))
+        }
+        _ => rewritten,
+    }
+}
+
+/// Replaces each double-quoted `source_schema` identifier that is followed by
+/// `.` with `target_qualifier`, skipping single-quoted literals, `--` and
+/// `/* */` comments.
+fn rewrite_quoted_schema_qualifier(sql: &str, source_schema: &str, target_qualifier: &str) -> String {
+    let source = format!("\"{}\"", source_schema.replace('"', "\"\""));
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0;
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let skip_to = match bytes[idx] {
+            b'\'' => {
+                let mut end = idx + 1;
+                while end < bytes.len() {
+                    if bytes[end] == b'\'' {
+                        if bytes.get(end + 1) == Some(&b'\'') {
+                            end += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    end += 1;
+                }
+                end + 1
+            }
+            b'-' if bytes.get(idx + 1) == Some(&b'-') => {
+                sql[idx..].find('\n').map_or(bytes.len(), |offset| idx + offset)
+            }
+            b'/' if bytes.get(idx + 1) == Some(&b'*') => {
+                sql[idx + 2..].find("*/").map_or(bytes.len(), |offset| idx + 2 + offset + 2)
+            }
+            b'"' => {
+                let end = parse_identifier_segment_end(sql, idx).unwrap_or(bytes.len());
+                if sql[idx..end] == source && sql[end..].starts_with('.') {
+                    out.push_str(&sql[copied..idx]);
+                    out.push_str(target_qualifier);
+                    copied = end;
+                }
+                end
+            }
+            _ => idx + 1,
+        };
+        idx = skip_to.min(bytes.len());
+    }
+    out.push_str(&sql[copied..]);
+    out
 }
 
 struct ParsedDdlName {
@@ -4535,6 +4777,7 @@ fn is_postgres_family_ddl(db_type: DatabaseType) -> bool {
             | DatabaseType::Vertica
             | DatabaseType::Exasol
             | DatabaseType::Uxdb
+            | DatabaseType::Gbase8c
     )
 }
 
@@ -4820,12 +5063,12 @@ fn default_literal(default: &str, data_type: &str, source: DialectKind, extra: O
     // is authoritative, so consult it before looking at the value at all: a
     // default is a literal unless the server says it was generated.
     if extra.is_some_and(|value| value.to_ascii_uppercase().contains("DEFAULT_GENERATED")) {
-        return normalized.to_string();
+        return mysql_defaults::generated_default(normalized, data_type);
     }
 
-    // MySQL writes an expression default wrapped in parentheses, `DEFAULT
-    // (uuid())`, and reports it that way. The wrapping is the syntax, so it is
-    // a reliable marker even when `EXTRA` is not populated. Note this asks
+    // Metadata paths that preserve DDL may keep the expression's parentheses,
+    // `DEFAULT (uuid())`. The wrapping is a reliable marker even when `EXTRA`
+    // is not populated. Note this asks
     // whether the value *is* parenthesised, not whether it merely contains a
     // parenthesis: the string default `a(b)` is not wrapped and is still
     // quoted.
@@ -5657,6 +5900,22 @@ fn generate_create_table_sql(
     };
     let table = qualified_name(name, db_type, schema);
 
+    let charset_clause = |col: &ColumnInfo, data_type: &str| {
+        let mut clause = String::new();
+        if effective_source_dialect(source_dialect, db_type) == DialectKind::Mysql
+            && matches!(db_type, DatabaseType::Mysql | DatabaseType::Goldendb)
+            && mysql_charset::supports_charset(data_type)
+        {
+            if let Some(charset) = mysql_charset_value(col.character_set.as_deref()) {
+                clause.push_str(&format!(" CHARACTER SET {}", quote_id(charset, db_type)));
+            }
+            if let Some(collation) = mysql_charset_value(col.collation.as_deref()) {
+                clause.push_str(&format!(" COLLATE {}", quote_id(collation, db_type)));
+            }
+        }
+        clause
+    };
+
     // Collect column definitions
     let mut col_defs = Vec::new();
     let mut pk_cols = Vec::new();
@@ -5671,6 +5930,15 @@ fn generate_create_table_sql(
         let mapped_type = map_type(col);
         if db_type == DatabaseType::SqlServer {
             col_defs.push(sqlserver_column_definition(col, &mapped_type, source_dialect, schema));
+            if col.is_primary_key {
+                pk_cols.push(col_name);
+            }
+            continue;
+        }
+        if let Some(clause) = kingbase_generation_clause(col, db_type, source_dialect) {
+            let mut definition = format!("{col_name} {mapped_type} {clause}");
+            definition.push_str(&column_modifier_tail(&profile, col, &mapped_type, db_type, source_dialect, true));
+            col_defs.push(definition);
             if col.is_primary_key {
                 pk_cols.push(col_name);
             }
@@ -5696,6 +5964,7 @@ fn generate_create_table_sql(
                     mapped_type.as_str()
                 };
                 let mut def = format!("{} {}", col_name, effective_type);
+                def.push_str(&charset_clause(col, effective_type));
                 def.push_str(&column_modifier_tail(&profile, col, &mapped_type, db_type, source_dialect, skip_default));
                 if profile.inline_column_comment {
                     if let Some(comment) = col.comment.as_deref().filter(|c| !c.is_empty()) {
@@ -5722,6 +5991,7 @@ fn generate_create_table_sql(
             }
             AutoIncColumnBuild::Normal { skip_default } => {
                 let mut def = format!("{} {}", col_name, mapped_type);
+                def.push_str(&charset_clause(col, &mapped_type));
                 def.push_str(&column_modifier_tail(&profile, col, &mapped_type, db_type, source_dialect, skip_default));
                 if profile.inline_column_comment {
                     if let Some(comment) = col.comment.as_deref().filter(|c| !c.is_empty()) {
@@ -5831,6 +6101,23 @@ fn generate_create_table_sql(
         }
     }
 
+    let (trigger_sql, missing) = generate_table_trigger_sql(name, triggers, db_type, schema, source_dialect);
+    if !trigger_sql.is_empty() {
+        lines.push(trigger_sql);
+    }
+    (lines.join("\n"), missing)
+}
+
+fn generate_table_trigger_sql(
+    name: &str,
+    triggers: &[TriggerInfo],
+    db_type: DatabaseType,
+    schema: Option<&str>,
+    source_dialect: Option<DialectKind>,
+) -> (String, Vec<MissingRollbackObject>) {
+    let mut lines = Vec::new();
+    let profile = profile_for(db_type);
+    let table = qualified_name(name, db_type, schema);
     // Trigger recreation — collect structured missing objects (do not rely on SQL comments alone).
     let mut missing: Vec<MissingRollbackObject> = Vec::new();
     if !triggers.is_empty() {
@@ -6020,6 +6307,7 @@ pub fn generate_schema_sync_sql(
         cascade_delete,
         source_dialect,
         field_mappings,
+        true,
     )
     .0
 }
@@ -6063,7 +6351,7 @@ pub fn generate_schema_sync_sql_plan(
     enable_rollback: bool,
     ignore_foreign_key_checks: bool,
 ) -> SchemaSyncSqlPlan {
-    let (sync_sql, _) = generate_schema_sync_sql_inner(
+    generate_schema_sync_sql_plan_with_oracle_ddl(
         diffs,
         function_diffs,
         sequence_diffs,
@@ -6074,6 +6362,78 @@ pub fn generate_schema_sync_sql_plan(
         cascade_delete,
         source_dialect,
         field_mappings,
+        enable_rollback,
+        ignore_foreign_key_checks,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_schema_sync_sql_plan_with_oracle_ddl(
+    diffs: &[TableDiff],
+    function_diffs: &[FunctionDiff],
+    sequence_diffs: &[SequenceDiff],
+    rule_diffs: &[RuleDiff],
+    owner_diffs: &[OwnerDiff],
+    db_type: DatabaseType,
+    schema: Option<&str>,
+    cascade_delete: bool,
+    source_dialect: Option<DialectKind>,
+    field_mappings: &[FieldMapping],
+    enable_rollback: bool,
+    ignore_foreign_key_checks: bool,
+    oracle_ddl: Option<&OracleSchemaSyncDdlSources>,
+) -> SchemaSyncSqlPlan {
+    generate_schema_sync_sql_plan_with_charset(
+        diffs,
+        function_diffs,
+        sequence_diffs,
+        rule_diffs,
+        owner_diffs,
+        db_type,
+        schema,
+        cascade_delete,
+        source_dialect,
+        field_mappings,
+        enable_rollback,
+        ignore_foreign_key_checks,
+        oracle_ddl,
+        true,
+    )
+}
+
+/// Apply the comparison charset policy to forward SQL; rollback restores target metadata.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_schema_sync_sql_plan_with_charset(
+    diffs: &[TableDiff],
+    function_diffs: &[FunctionDiff],
+    sequence_diffs: &[SequenceDiff],
+    rule_diffs: &[RuleDiff],
+    owner_diffs: &[OwnerDiff],
+    db_type: DatabaseType,
+    schema: Option<&str>,
+    cascade_delete: bool,
+    source_dialect: Option<DialectKind>,
+    field_mappings: &[FieldMapping],
+    enable_rollback: bool,
+    ignore_foreign_key_checks: bool,
+    oracle_ddl: Option<&OracleSchemaSyncDdlSources>,
+    compare_charset: bool,
+) -> SchemaSyncSqlPlan {
+    let (sync_sql, forward_issues) = generate_schema_sync_sql_inner_with_oracle_ddl(
+        diffs,
+        function_diffs,
+        sequence_diffs,
+        rule_diffs,
+        owner_diffs,
+        db_type,
+        schema,
+        cascade_delete,
+        source_dialect,
+        field_mappings,
+        oracle_ddl.map(|sources| sources.forward.as_slice()),
+        oracle_ddl.map_or(&[], |sources| sources.table_mappings.as_slice()),
+        compare_charset,
     );
     let sync_sql =
         if ignore_foreign_key_checks { wrap_script_with_foreign_key_checks(&sync_sql, db_type) } else { sync_sql };
@@ -6081,7 +6441,27 @@ pub fn generate_schema_sync_sql_plan(
     let (rollback_sync_sql, missing_rollback_objects) = if enable_rollback {
         let dependency_graph = DependencyGraph { nodes: HashMap::new(), topological_order: Vec::new() };
         let rollback_graph = RollbackGraph::from_forward_diffs(diffs, &[], &dependency_graph);
-        let (sql, missing) = generate_rollback_sync_sql_with_missing(&rollback_graph, db_type, schema, cascade_delete);
+        let (sql, missing) = if let Some(sources) = oracle_ddl {
+            let rollback_diffs =
+                rollback_graph.rollback_nodes.iter().map(|node| node.table_diff.clone()).collect::<Vec<_>>();
+            generate_schema_sync_sql_inner_with_oracle_ddl(
+                &rollback_diffs,
+                &[],
+                &[],
+                &[],
+                &[],
+                db_type,
+                schema,
+                cascade_delete,
+                None,
+                &[],
+                Some(&sources.rollback),
+                &[],
+                true,
+            )
+        } else {
+            generate_rollback_sync_sql_with_missing(&rollback_graph, db_type, schema, cascade_delete)
+        };
         let sql = if ignore_foreign_key_checks { wrap_script_with_foreign_key_checks(&sql, db_type) } else { sql };
         (Some(sql), missing)
     } else {
@@ -6093,7 +6473,37 @@ pub fn generate_schema_sync_sql_plan(
         RollbackCompleteness::Incomplete
     };
 
-    SchemaSyncSqlPlan { sync_sql, rollback_sync_sql, rollback_completeness, missing_rollback_objects }
+    let report_generation_issues =
+        oracle_ddl.is_some() || (!compare_charset && matches!(db_type, DatabaseType::Mysql | DatabaseType::Goldendb));
+    let forward_completeness = if report_generation_issues && !forward_issues.is_empty() {
+        RollbackCompleteness::Incomplete
+    } else {
+        RollbackCompleteness::Complete
+    };
+    let generation_issues = if report_generation_issues {
+        forward_issues
+            .iter()
+            .map(|issue| ("forward", issue))
+            .chain(missing_rollback_objects.iter().map(|issue| ("rollback", issue)))
+            .map(|(direction, issue)| SchemaSyncGenerationIssue {
+                direction: direction.into(),
+                kind: issue.kind.clone(),
+                name: issue.name.clone(),
+                table: issue.table.clone(),
+                reason: issue.reason.clone(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    SchemaSyncSqlPlan {
+        sync_sql,
+        forward_completeness,
+        generation_issues,
+        rollback_sync_sql,
+        rollback_completeness,
+        missing_rollback_objects,
+    }
 }
 
 /// Names of the objects a diff's own statements reference.
@@ -6243,6 +6653,7 @@ fn order_diffs_for_execution(diffs: &[TableDiff]) -> Vec<&TableDiff> {
     ordered.into_iter().map(|index| &diffs[index]).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_schema_sync_sql_inner(
     diffs: &[TableDiff],
     function_diffs: &[FunctionDiff],
@@ -6254,8 +6665,44 @@ fn generate_schema_sync_sql_inner(
     cascade_delete: bool,
     source_dialect: Option<DialectKind>,
     field_mappings: &[FieldMapping],
+    compare_charset: bool,
+) -> (String, Vec<MissingRollbackObject>) {
+    generate_schema_sync_sql_inner_with_oracle_ddl(
+        diffs,
+        function_diffs,
+        sequence_diffs,
+        rule_diffs,
+        owner_diffs,
+        db_type,
+        schema,
+        cascade_delete,
+        source_dialect,
+        field_mappings,
+        None,
+        &[],
+        compare_charset,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_schema_sync_sql_inner_with_oracle_ddl(
+    diffs: &[TableDiff],
+    function_diffs: &[FunctionDiff],
+    sequence_diffs: &[SequenceDiff],
+    rule_diffs: &[RuleDiff],
+    owner_diffs: &[OwnerDiff],
+    db_type: DatabaseType,
+    schema: Option<&str>,
+    cascade_delete: bool,
+    source_dialect: Option<DialectKind>,
+    field_mappings: &[FieldMapping],
+    oracle_ddl: Option<&[OracleSchemaSyncTableDdl]>,
+    table_mappings: &[SchemaDiffTableMapping],
+    compare_charset: bool,
 ) -> (String, Vec<MissingRollbackObject>) {
     let mut lines = Vec::new();
+    let mut deferred_oracle_foreign_keys = Vec::new();
+    let mut deferred_oracle_triggers = Vec::new();
     let mut missing_objects: Vec<MissingRollbackObject> = Vec::new();
     let profile = profile_for(db_type);
     // SQL Server has no DROP ... CASCADE syntax (related constraints are handled explicitly
@@ -6282,6 +6729,10 @@ fn generate_schema_sync_sql_inner(
     for diff in order_diffs_for_execution(diffs) {
         let target_name = target_table_name(diff);
         let table = qualified_name(target_name, db_type, schema);
+        let captured = oracle_ddl.and_then(|sources| sources.iter().find(|source| source.diff_name == diff.name));
+        if let Some(captured) = captured {
+            missing_objects.extend(captured.issues.clone());
+        }
 
         if diff.diff_type == "added" && diff.object_type.as_deref() == Some("view") {
             if let Some(ddl) = &diff.ddl {
@@ -6305,6 +6756,45 @@ fn generate_schema_sync_sql_inner(
         }
 
         if diff.diff_type == "added" && diff.object_type.as_deref() != Some("view") {
+            let create_start = lines.len();
+            if let Some(captured) = captured {
+                let trigger_snapshots = diff
+                    .triggers
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|trigger| trigger.source.clone())
+                    .collect::<Vec<_>>();
+                match captured.render_table(
+                    schema.unwrap_or(&captured.owner),
+                    target_name,
+                    table_mappings,
+                    &trigger_snapshots,
+                ) {
+                    Ok(parts) => {
+                        lines.push(parts.table_ddl);
+                        lines.extend(parts.indexes);
+                        lines.extend(parts.supporting_constraints);
+                        lines.push(parts.trailing_ddl);
+                        deferred_oracle_foreign_keys.extend(parts.foreign_keys);
+                        let (trigger_sql, missing) = captured.render_triggers(
+                            parts.triggers,
+                            &trigger_snapshots,
+                            schema.unwrap_or(&captured.owner),
+                            target_name,
+                        );
+                        deferred_oracle_triggers.extend(trigger_sql);
+                        missing_objects.extend(missing);
+                        continue;
+                    }
+                    Err(reason) => missing_objects.push(MissingRollbackObject {
+                        kind: "table".into(),
+                        name: diff.name.clone(),
+                        table: Some(target_name.into()),
+                        reason,
+                    }),
+                }
+            }
             let has_structured_snapshot = diff.columns.as_ref().is_some_and(|columns| !columns.is_empty());
             let is_rollback_recreation = diff.ddl.is_none() && diff.target_ddl.is_some();
             if is_rollback_recreation {
@@ -6351,7 +6841,11 @@ fn generate_schema_sync_sql_inner(
                 // Prefer native source DDL when the target profile wants it
                 // (MySQL-family), or as fallback without a structured snapshot.
                 if let Some(ddl) = &diff.ddl {
-                    let ddl = rewrite_ddl_header_qualifier(ddl, TABLE_DDL_HEADER_KEYWORDS, schema, &table);
+                    let ddl = if db_type == DatabaseType::Oracle {
+                        rewrite_oracle_native_table_ddl(ddl, schema, &table)
+                    } else {
+                        rewrite_ddl_header_qualifier(ddl, TABLE_DDL_HEADER_KEYWORDS, schema, &table)
+                    };
                     lines.push(format!("-- Create {}: {}", diff.object_type.as_deref().unwrap_or("table"), diff.name));
                     lines.push(format!("{};", ddl.trim_end().trim_end_matches(';')));
                     lines.push(String::new());
@@ -6403,6 +6897,22 @@ fn generate_schema_sync_sql_inner(
                     lines.push(gen);
                 }
                 missing_objects.extend(missing);
+            }
+            if !compare_charset && matches!(db_type, DatabaseType::Mysql | DatabaseType::Goldendb) {
+                for sql in &mut lines[create_start..] {
+                    match mysql_charset::without_create_charset(sql) {
+                        Ok(filtered) => *sql = filtered,
+                        Err(reason) => {
+                            sql.clear();
+                            missing_objects.push(MissingRollbackObject {
+                                kind: "table".into(),
+                                name: diff.name.clone(),
+                                table: Some(target_name.into()),
+                                reason,
+                            });
+                        }
+                    }
+                }
             }
             continue;
         }
@@ -6466,7 +6976,14 @@ fn generate_schema_sync_sql_inner(
                             } else {
                                 String::new()
                             };
-                            let definition = column_def(&convert_col(source), db_type, source_dialect);
+                            // A MySQL column added without its own `CHARACTER SET`/`COLLATE`
+                            // inherits the target table default, so a source column that differs
+                            // from that default would show up again as a collation change on the
+                            // next comparison (#11802).
+                            let include_charset = compare_charset
+                                && effective_source_dialect(source_dialect, db_type) == DialectKind::Mysql;
+                            let definition =
+                                column_def_with_charset(&convert_col(source), db_type, source_dialect, include_charset);
                             // Oracle has no `COLUMN` keyword here: it parenthesizes the whole
                             // definition (`ADD (AMT NUMBER(12,2))`) instead.
                             parts.push(if profile.add_column_uses_column_keyword {
@@ -6528,14 +7045,24 @@ fn generate_schema_sync_sql_inner(
                                     parts.push(format!("  {modify_keyword} ({definition})"));
                                 }
                             } else if profile.alter_uses_modify_column {
-                                if column.changes.iter().any(|change| !change.starts_with("order:")) {
+                                if column.changes.iter().any(|change| {
+                                    !change.starts_with("order:")
+                                        && (compare_charset
+                                            || (!change.starts_with("character set:")
+                                                && !change.starts_with("collation:")))
+                                }) {
                                     let modify_keyword = profile.alter_modify_keyword();
-                                    let include_charset = column.changes.iter().any(|change| {
-                                        change.starts_with("character set:") || change.starts_with("collation:")
-                                    });
+                                    // MODIFY must retain the target column charset when ignored.
+                                    let use_source_charset = compare_charset
+                                        && effective_source_dialect(source_dialect, db_type) == DialectKind::Mysql;
+                                    if !use_source_charset {
+                                        mapped.character_set =
+                                            column.target.as_ref().and_then(|col| col.character_set.clone());
+                                        mapped.collation = column.target.as_ref().and_then(|col| col.collation.clone());
+                                    }
                                     parts.push(format!(
                                         "  {modify_keyword} {}",
-                                        column_def_with_charset(&mapped, db_type, source_dialect, include_charset)
+                                        column_def_with_charset(&mapped, db_type, source_dialect, true)
                                     ));
                                 }
                             } else {
@@ -6571,14 +7098,20 @@ fn generate_schema_sync_sql_inner(
                     "renamed" => {
                         if let (Some(source), Some(target_col)) = (&column.source, &column.target) {
                             use crate::sql_dialect::ddl_profile::RenameColumnSyntax;
-                            let mapped = convert_col(source);
+                            let mut mapped = convert_col(source);
                             match profile.rename_column {
                                 RenameColumnSyntax::MysqlChangeColumn => {
+                                    let use_source_charset = compare_charset
+                                        && effective_source_dialect(source_dialect, db_type) == DialectKind::Mysql;
+                                    if !use_source_charset {
+                                        mapped.character_set = target_col.character_set.clone();
+                                        mapped.collation = target_col.collation.clone();
+                                    }
                                     let old_name = quote_id(&target_col.name, db_type);
                                     parts.push(format!(
                                         "  CHANGE COLUMN {} {}",
                                         old_name,
-                                        column_def(&mapped, db_type, source_dialect)
+                                        column_def_with_charset(&mapped, db_type, source_dialect, true,)
                                     ));
                                 }
                                 RenameColumnSyntax::RenameColumn => {
@@ -6683,9 +7216,60 @@ fn generate_schema_sync_sql_inner(
             let comment = diff.source_table_comment.as_ref().and_then(|comment| comment.as_deref()).unwrap_or_default();
             lines.extend(table_comment_sql(target_name, comment, db_type, schema));
         }
+        if compare_charset && matches!(db_type, DatabaseType::Mysql | DatabaseType::Goldendb) {
+            if let Some(charset) = &diff.table_charset {
+                let mut clauses = Vec::new();
+                if let Some(value) = mysql_charset_value(charset.source.character_set.as_deref()) {
+                    clauses.push(format!("DEFAULT CHARACTER SET {}", quote_id(value, db_type)));
+                }
+                if let Some(value) = mysql_charset_value(charset.source.collation.as_deref()) {
+                    clauses.push(format!("COLLATE {}", quote_id(value, db_type)));
+                }
+                if !clauses.is_empty() {
+                    lines.push(format!("ALTER TABLE {table} {};", clauses.join(" ")));
+                }
+            }
+        }
 
         if let Some(indexes) = &diff.indexes {
             for index in indexes {
+                if let Some(captured) = captured {
+                    if matches!(index.diff_type.as_str(), "added" | "removed" | "modified") {
+                        let drops = matches!(index.diff_type.as_str(), "removed" | "modified");
+                        if drops && captured.protected_drop_indexes.contains(&index.name) {
+                            missing_objects.push(MissingRollbackObject { kind: "index".into(), name: index.name.clone(), table: Some(target_name.into()), reason: "Index supports a retained primary or unique constraint; its dependencies must be migrated before replacement".into() });
+                            continue;
+                        }
+                        let creates = matches!(index.diff_type.as_str(), "added" | "modified");
+                        let create = if creates {
+                            match captured.render_index(
+                                index.source.as_ref().map_or(index.name.as_str(), |source| source.name.as_str()),
+                                schema.unwrap_or(&captured.owner),
+                                target_name,
+                            ) {
+                                Ok(sql) => Some(sql),
+                                Err(reason) => {
+                                    missing_objects.push(MissingRollbackObject {
+                                        kind: "index".into(),
+                                        name: index.name.clone(),
+                                        table: Some(target_name.into()),
+                                        reason,
+                                    });
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if drops {
+                            lines.push(drop_index_sql(target_name, &index.name, db_type, schema));
+                        }
+                        if let Some(create) = create {
+                            lines.push(create);
+                        }
+                        continue;
+                    }
+                }
                 match index.diff_type.as_str() {
                     "added" => {
                         if let Some(source) = &index.source {
@@ -6726,6 +7310,14 @@ fn generate_schema_sync_sql_inner(
                     "-- Trigger {}: {} on {}; review trigger definition manually.",
                     trigger.diff_type, trigger.name, diff.name
                 ));
+                if matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle) {
+                    missing_objects.push(MissingRollbackObject {
+                        kind: "trigger".into(),
+                        name: trigger.name.clone(),
+                        table: Some(target_name.into()),
+                        reason: "Trigger synchronization requires a complete reviewed definition; no trigger DDL was generated".into(),
+                    });
+                }
             }
         }
 
@@ -6749,6 +7341,10 @@ fn generate_schema_sync_sql_inner(
         lines.push(String::new());
         lines.push("-- Functions".to_string());
         for diff in function_diffs {
+            if matches!(diff.program_kind, Some(ObjectSourceKind::Package | ObjectSourceKind::PackageBody)) {
+                lines.push("-- Package DDL requires a reviewed package plan.".into());
+                continue;
+            }
             match diff.diff_type.as_str() {
                 "added" | "modified" => {
                     if let Some(source) = &diff.source {
@@ -6910,6 +7506,8 @@ fn generate_schema_sync_sql_inner(
         }
     }
 
+    lines.extend(deferred_oracle_foreign_keys);
+    lines.extend(deferred_oracle_triggers);
     (lines.join("\n").trim().to_string(), missing_objects)
 }
 
@@ -6919,6 +7517,10 @@ mod tests {
 
     fn index(overrides: IndexInfo) -> IndexInfo {
         IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: if overrides.name.is_empty() { "idx_users_email".to_string() } else { overrides.name },
             columns: if overrides.columns.is_empty() { vec!["email".to_string()] } else { overrides.columns },
             is_unique: overrides.is_unique,
@@ -7083,9 +7685,238 @@ mod tests {
         options.source_details[0].ddl =
             Some("CREATE TABLE users (name varchar(64)) DEFAULT CHARSET=utf8mb4".to_string());
         options.target_details[0].ddl =
-            Some("CREATE TABLE users (name varchar(64)) DEFAULT CHARSET=latin1".to_string());
+            Some("CREATE TABLE users (name varchar(64)) DEFAULT CHARSET=utf8mb4".to_string());
 
-        assert!(prepare_schema_diff(options).diffs.is_empty());
+        assert!(prepare_schema_diff(options.clone()).diffs.is_empty());
+
+        // Unknown column metadata does not hide a known table-default change.
+        options.target_details[0].ddl =
+            Some("CREATE TABLE users (name varchar(64)) DEFAULT CHARSET=latin1".to_string());
+        let result = prepare_schema_diff(options);
+        assert!(result.diffs[0].columns.is_none());
+        assert!(result.diffs[0].table_charset.is_some());
+    }
+
+    #[test]
+    fn mysql_added_column_keeps_source_charset_and_collation() {
+        let mut options = mysql_charset_options(true);
+        let mut name = options.source_details[0].columns[0].clone();
+        name.collation = Some("utf8mb4_general_ci".to_string());
+        options.source_details[0].columns = vec![column("id", "int", None), name, column("amount", "int", None)];
+        options.target_details[0].columns = vec![column("id", "int", None)];
+
+        let result = prepare_schema_diff(options);
+
+        assert!(
+            result.sync_sql.contains(
+                "ADD COLUMN `name` varchar(64) CHARACTER SET `utf8mb4` COLLATE `utf8mb4_general_ci` NOT NULL AFTER `id`"
+            ),
+            "{}",
+            result.sync_sql
+        );
+        assert!(result.sync_sql.contains("ADD COLUMN `amount` int NOT NULL AFTER `name`"), "{}", result.sync_sql);
+    }
+
+    fn mysql_charset_plan(result: &SchemaDiffPreparation, enabled: bool) -> SchemaSyncSqlPlan {
+        generate_schema_sync_sql_plan_with_charset(
+            &result.diffs,
+            &[],
+            &[],
+            &[],
+            &[],
+            DatabaseType::Mysql,
+            None,
+            false,
+            Some(DialectKind::Mysql),
+            &[],
+            true,
+            false,
+            None,
+            enabled,
+        )
+    }
+
+    #[test]
+    fn mysql_disabled_charset_additions_inherit_target_defaults_even_after_regeneration() {
+        let mut options = mysql_charset_options(false);
+        options.target_details[0].columns.clear();
+        let result = prepare_schema_diff(options);
+        let plan = mysql_charset_plan(&result, false);
+        for sql in [&result.sync_sql, result.diffs[0].sync_sql.as_ref().unwrap(), &plan.sync_sql] {
+            assert!(sql.contains("ADD COLUMN `name` varchar(64)"), "{sql}");
+            assert!(!sql.contains("CHARACTER SET"), "{sql}");
+            assert!(!sql.contains("COLLATE"), "{sql}");
+        }
+        assert!(mysql_charset_plan(&result, true).sync_sql.contains("COLLATE `utf8mb4_0900_ai_ci`"));
+    }
+
+    #[test]
+    fn mysql_disabled_charset_modifications_and_rollback_preserve_target_column_settings() {
+        let mut options = mysql_charset_options(false);
+        options.source_details[0].columns[0].data_type = "varchar(128)".into();
+        let result = prepare_schema_diff(options);
+        let plan = mysql_charset_plan(&result, false);
+        for sql in [&result.sync_sql, &plan.sync_sql] {
+            assert!(
+                sql.contains("MODIFY COLUMN `name` varchar(128) CHARACTER SET `latin1` COLLATE `latin1_swedish_ci`"),
+                "{sql}"
+            );
+            assert!(!sql.contains("utf8mb4_0900_ai_ci"), "{sql}");
+        }
+        let rollback = plan.rollback_sync_sql.unwrap();
+        assert!(rollback.contains("varchar(64) CHARACTER SET `latin1` COLLATE `latin1_swedish_ci`"), "{rollback}");
+        let enabled = mysql_charset_plan(&result, true).sync_sql;
+        assert!(enabled.contains("varchar(128) CHARACTER SET `utf8mb4` COLLATE `utf8mb4_0900_ai_ci`"), "{enabled}");
+    }
+
+    #[test]
+    fn mysql_charset_is_not_applied_when_converting_a_character_column_to_a_number() {
+        let mut options = mysql_charset_options(false);
+        let source = &mut options.source_details[0].columns[0];
+        source.data_type = "int".into();
+        source.character_set = None;
+        source.collation = None;
+        let result = prepare_schema_diff(options);
+        let sql = mysql_charset_plan(&result, false).sync_sql;
+        assert!(sql.contains("MODIFY COLUMN `name` int"), "{sql}");
+        assert!(!sql.contains("CHARACTER SET"), "{sql}");
+        assert!(!sql.contains("COLLATE"), "{sql}");
+    }
+
+    #[test]
+    fn mysql_target_keeps_ignored_charset_when_the_source_is_postgres() {
+        let mut options = mysql_charset_options(false);
+        options.source_dialect = Some(DialectKind::Postgres);
+        let source = &mut options.source_details[0].columns[0];
+        source.data_type = "varchar(128)".into();
+        source.character_set = None;
+        source.collation = None;
+        let result = prepare_schema_diff(options);
+        assert!(result.sync_sql.contains("CHARACTER SET `latin1` COLLATE `latin1_swedish_ci`"), "{}", result.sync_sql);
+        for renamed in [false, true] {
+            let mut diffs = result.diffs.clone();
+            if renamed {
+                let column = &mut diffs[0].columns.as_mut().unwrap()[0];
+                column.diff_type = "renamed".into();
+                column.name = "new_name".into();
+                column.source.as_mut().unwrap().name = "new_name".into();
+            }
+            let plan = generate_schema_sync_sql_plan_with_charset(
+                &diffs,
+                &[],
+                &[],
+                &[],
+                &[],
+                DatabaseType::Mysql,
+                None,
+                false,
+                Some(DialectKind::Postgres),
+                &[],
+                true,
+                false,
+                None,
+                false,
+            );
+            assert!(
+                plan.sync_sql.contains("varchar(128) CHARACTER SET `latin1` COLLATE `latin1_swedish_ci`"),
+                "{}",
+                plan.sync_sql
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_disabled_charset_rename_preserves_target_settings_in_change_column() {
+        let mut options = mysql_charset_options(false);
+        options.source_details[0].columns[0].data_type = "varchar(128)".into();
+        let mut result = prepare_schema_diff(options);
+        let column = &mut result.diffs[0].columns.as_mut().unwrap()[0];
+        column.diff_type = "renamed".into();
+        column.name = "new_name".into();
+        column.source.as_mut().unwrap().name = "new_name".into();
+        let plan = mysql_charset_plan(&result, false);
+        assert!(
+            plan.sync_sql.contains(
+                "CHANGE COLUMN `name` `new_name` varchar(128) CHARACTER SET `latin1` COLLATE `latin1_swedish_ci`"
+            ),
+            "{}",
+            plan.sync_sql
+        );
+        let rollback = plan.rollback_sync_sql.unwrap();
+        assert!(
+            rollback.contains(
+                "CHANGE COLUMN `new_name` `name` varchar(64) CHARACTER SET `latin1` COLLATE `latin1_swedish_ci`"
+            ),
+            "{rollback}"
+        );
+    }
+
+    #[test]
+    fn mysql_new_table_charset_policy_covers_native_and_structured_creation() {
+        for native in [false, true] {
+            let mut options = mysql_charset_options(false);
+            options.target_tables.clear();
+            options.target_details.clear();
+            if native {
+                options.source_details[0].ddl = Some(
+                    "CREATE TABLE `users` (`name` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci COMMENT 'CHARSET=utf8') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci".into(),
+                );
+            }
+            let result = prepare_schema_diff(options);
+            let plan = mysql_charset_plan(&result, false);
+            for sql in [&result.sync_sql, &plan.sync_sql] {
+                assert!(sql.contains("CREATE TABLE"), "{sql}");
+                assert!(!sql.contains("CHARACTER SET"), "{sql}");
+                assert!(!sql.contains("COLLATE"), "{sql}");
+                assert!(!sql.contains("DEFAULT CHARSET"), "{sql}");
+                if native {
+                    assert!(sql.contains("COMMENT 'CHARSET=utf8'"), "{sql}");
+                    assert!(sql.contains("ENGINE=InnoDB"), "{sql}");
+                }
+            }
+            let enabled = mysql_charset_plan(&result, true).sync_sql;
+            assert!(enabled.contains("CHARACTER SET"), "{enabled}");
+            assert!(enabled.contains("utf8mb4_0900_ai_ci"), "{enabled}");
+        }
+    }
+
+    #[test]
+    fn mysql_table_default_charset_difference_is_optional_and_reversible() {
+        let mut options = mysql_charset_options(false);
+        options.target_details[0].columns = options.source_details[0].columns.clone();
+        options.source_details[0].ddl =
+            Some("CREATE TABLE users (name varchar(64)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci".into());
+        options.target_details[0].ddl =
+            Some("CREATE TABLE users (name varchar(64)) DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci".into());
+        assert!(prepare_schema_diff(options.clone()).diffs.is_empty());
+        options.compare_charset = true;
+        let result = prepare_schema_diff(options);
+        assert!(result.diffs[0].table_charset.is_some());
+        assert!(result.diffs[0].columns.is_none());
+        let plan = mysql_charset_plan(&result, true);
+        assert!(
+            plan.sync_sql.contains("DEFAULT CHARACTER SET `utf8mb4` COLLATE `utf8mb4_0900_ai_ci`"),
+            "{}",
+            plan.sync_sql
+        );
+        let rollback = plan.rollback_sync_sql.unwrap();
+        assert!(rollback.contains("DEFAULT CHARACTER SET `latin1` COLLATE `latin1_swedish_ci`"), "{rollback}");
+        assert!(mysql_charset_plan(&result, false).sync_sql.trim().is_empty());
+    }
+
+    #[test]
+    fn added_column_charset_is_not_carried_across_dialects() {
+        let mut options = mysql_charset_options(true);
+        let name = options.source_details[0].columns[0].clone();
+        options.source_details[0].columns = vec![column("id", "int", None), name];
+        options.target_details[0].columns = vec![column("id", "int", None)];
+        options.source_dialect = Some(DialectKind::Postgres);
+
+        let result = prepare_schema_diff(options);
+
+        assert!(result.sync_sql.contains("ADD COLUMN `name`"), "{}", result.sync_sql);
+        assert!(!result.sync_sql.contains("CHARACTER SET"), "{}", result.sync_sql);
+        assert!(!result.sync_sql.contains("COLLATE"), "{}", result.sync_sql);
     }
 
     #[test]
@@ -7113,6 +7944,10 @@ mod tests {
         target_column.column_default = Some("target".to_string());
         target_column.comment = Some("target comment".to_string());
         options.source_details[0].indexes.push(index(IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "uq_users_name".to_string(),
             columns: vec!["name".to_string()],
             is_unique: true,
@@ -7326,6 +8161,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         }
     }
@@ -8074,6 +8910,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: Some(Some("new table description".into())),
             target_table_comment: Some(Some("old table description".into())),
+            table_charset: None,
             sync_sql: None,
         };
 
@@ -8174,6 +9011,7 @@ mod tests {
     fn sqlserver_function_and_sequence_changes_use_tsql_verbs() {
         let function = FunctionDiff {
             diff_type: "modified".into(),
+            program_kind: None,
             name: "next_value".into(),
             source: Some(FunctionInfo {
                 name: "next_value".into(),
@@ -8187,6 +9025,7 @@ mod tests {
         };
         let removed_function = FunctionDiff {
             diff_type: "removed".into(),
+            program_kind: None,
             name: "old_value".into(),
             source: None,
             target: None,
@@ -8248,6 +9087,10 @@ mod tests {
     fn sqlserver_drops_changed_indexes_and_defaults_before_columns() {
         let target_column = ColumnInfo { column_default: Some("((0))".into()), ..column("legacy_status", "int", None) };
         let target_index = IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "idx_events_legacy_status".into(),
             columns: vec!["legacy_status".into()],
             is_unique: false,
@@ -8313,6 +9156,10 @@ mod tests {
         let source_column = column("amount", "bigint", None);
         let target_column = column("amount", "int", None);
         let unchanged_index = IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "idx_events_amount".into(),
             columns: vec!["amount".into()],
             is_unique: false,
@@ -8383,6 +9230,10 @@ mod tests {
     #[test]
     fn sqlserver_index_and_foreign_key_forms_follow_tsql() {
         let btree = IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "idx_events_status".into(),
             columns: vec!["status".into()],
             is_unique: true,
@@ -8404,6 +9255,10 @@ mod tests {
         assert!(!btree_sql.contains("BTREE"));
 
         let columnstore = IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "ix_events_analytics".into(),
             columns: Vec::new(),
             is_unique: false,
@@ -8448,6 +9303,7 @@ mod tests {
         }];
         let trigger = TriggerInfo {
             name: "trg_events_insert".into(),
+            oracle_metadata: None,
             event: "INSERT".into(),
             timing: "AFTER".into(),
             level: None,
@@ -8509,6 +9365,7 @@ mod tests {
 
         let native_function = FunctionDiff {
             diff_type: "modified".into(),
+            program_kind: None,
             name: "next_value".into(),
             source: Some(FunctionInfo {
                 name: "next_value".into(),
@@ -8556,6 +9413,7 @@ mod tests {
 
         let foreign_function = FunctionDiff {
             diff_type: "added".into(),
+            program_kind: None,
             name: "pg_only".into(),
             source: Some(FunctionInfo {
                 name: "pg_only".into(),
@@ -9117,6 +9975,10 @@ mod tests {
     fn detects_modified_indexes_not_only_added_or_removed_indexes() {
         let diffs = diff_indexes(
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_orders_status".to_string(),
                 columns: vec!["status".to_string(), "created_at".to_string()],
                 is_unique: false,
@@ -9131,6 +9993,10 @@ mod tests {
                 constraint_backed: false,
             })],
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_orders_status".to_string(),
                 columns: vec!["status".to_string()],
                 is_unique: true,
@@ -9154,6 +10020,10 @@ mod tests {
     #[test]
     fn detects_opclass_change_in_postgres_index() {
         let source_index = index(IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "idx_name_trgm".to_string(),
             columns: vec!["name".to_string()],
             is_unique: false,
@@ -9168,6 +10038,10 @@ mod tests {
             constraint_backed: false,
         });
         let target_index = index(IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "idx_name_trgm".to_string(),
             columns: vec!["name".to_string()],
             is_unique: false,
@@ -9197,6 +10071,10 @@ mod tests {
     fn detects_mysql_functional_index_changes_and_preserves_expression_ddl() {
         let functional_key_part = "((case when (`STATUS` = _utf8mb4'online') then _utf8mb4'online' else NULL end))";
         let source_index = index(IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "test_UNIQUE".to_string(),
             columns: vec!["attr".to_string(), "attr2".to_string(), functional_key_part.to_string()],
             is_unique: true,
@@ -9211,6 +10089,10 @@ mod tests {
             constraint_backed: false,
         });
         let target_index = index(IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "test_UNIQUE".to_string(),
             columns: vec!["attr".to_string(), "attr2".to_string()],
             is_unique: true,
@@ -9244,6 +10126,7 @@ mod tests {
                 target_ddl: None,
                 source_table_comment: None,
                 target_table_comment: None,
+                table_charset: None,
                 sync_sql: None,
             }],
             &[],
@@ -9265,12 +10148,49 @@ mod tests {
     }
 
     #[test]
+    fn kingbase_agent_index_metadata_survives_sync_ddl() {
+        let index: IndexInfo = serde_json::from_value(serde_json::json!({
+            "name": "expression_idx", "columns": ["lower(name)", "id"],
+            "is_unique": false, "is_primary": false, "filter": "active = 1",
+            "index_type": "btree", "included_columns": ["payload"], "comment": null,
+            "key_is_expression": [true, false], "key_options": [0, 3]
+        }))
+        .unwrap();
+        let ddl = create_index_sql("orders", &index, DatabaseType::Kingbase, Some("public"));
+        assert!(ddl.contains("(lower(name) ASC NULLS LAST, \"id\" DESC NULLS FIRST)"), "{ddl}");
+        assert!(ddl.contains("INCLUDE (\"payload\") WHERE active = 1"), "{ddl}");
+        assert!(!ddl.contains("\"lower(name)\""), "{ddl}");
+    }
+
+    #[test]
+    fn kingbase_index_ddl_keeps_long_expressions_and_non_btree_option_semantics() {
+        let expression = format!("coalesce(lower(name), '{}')", "synthetic".repeat(20));
+        for index_type in ["btree", "gin", "gist"] {
+            let index: IndexInfo = serde_json::from_value(serde_json::json!({
+                "name": "expression_idx", "columns": [expression],
+                "is_unique": false, "is_primary": false, "filter": "active = 1",
+                "index_type": index_type, "included_columns": [], "comment": null,
+                "key_is_expression": [true], "key_options": [3]
+            }))
+            .unwrap();
+            let ddl = create_index_sql("orders", &index, DatabaseType::Kingbase, Some("public"));
+            assert!(ddl.contains(&expression), "{ddl}");
+            assert_eq!(ddl.contains("DESC NULLS FIRST"), index_type == "btree", "{ddl}");
+            assert!(ddl.ends_with("WHERE active = 1;"), "{ddl}");
+        }
+    }
+
+    #[test]
     fn preserves_bare_expression_in_postgres_family_unique_index_ddl() {
         // Regression for #6295: highgo/postgres-family expression index key parts (e.g. from
         // pg_get_indexdef) arrived as raw expression text in IndexInfo.columns; quoting the
         // whole expression as an identifier turned it into a literal (and nonexistent) column.
         let expression_key_part = "COALESCE(height, '-1'::integer::double precision)";
         let new_index = index(IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "uq_tankong_sta_type_time".to_string(),
             columns: vec![
                 "sta_id".to_string(),
@@ -9310,6 +10230,7 @@ mod tests {
                 target_ddl: None,
                 source_table_comment: None,
                 target_table_comment: None,
+                table_charset: None,
                 sync_sql: None,
             }],
             &[],
@@ -9339,6 +10260,10 @@ mod tests {
         let expression_key_part =
             "(((category)::text = ANY ((ARRAY['industrial'::character varying, 'macro'::character varying])::text[])))";
         let new_index = index(IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "index_repro_rank".to_string(),
             columns: vec![
                 "((has_current_analysis AND (NOT dirty) AND researchable))".to_string(),
@@ -9381,6 +10306,7 @@ mod tests {
                 target_ddl: None,
                 source_table_comment: None,
                 target_table_comment: None,
+                table_charset: None,
                 sync_sql: None,
             }],
             &[],
@@ -9410,6 +10336,10 @@ mod tests {
         // `indoption` is only meaningful for B-tree keys, so a GIN index must not gain
         // `ASC NULLS LAST` suffixes even when the introspection reports the flags.
         let new_index = index(IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "idx_payload_gin".to_string(),
             columns: vec!["payload".to_string()],
             is_unique: false,
@@ -9444,6 +10374,7 @@ mod tests {
                 target_ddl: None,
                 source_table_comment: None,
                 target_table_comment: None,
+                table_charset: None,
                 sync_sql: None,
             }],
             &[],
@@ -9473,6 +10404,10 @@ mod tests {
         // parts from pg_get_indexdef are left unquoted.
         let expression_key_part = "COALESCE(height, '-1'::integer::double precision)";
         let new_index = index(IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: "uq_weird_columns".to_string(),
             columns: vec![
                 "order item".to_string(),
@@ -9512,6 +10447,7 @@ mod tests {
                 target_ddl: None,
                 source_table_comment: None,
                 target_table_comment: None,
+                table_charset: None,
                 sync_sql: None,
             }],
             &[],
@@ -9548,6 +10484,10 @@ mod tests {
     fn quotes_expression_like_column_names_without_agent_provenance() {
         for db_type in [DatabaseType::Kingbase, DatabaseType::Vastbase] {
             let new_index = index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_weird_columns".to_string(),
                 columns: vec!["order item".to_string(), "a(b)".to_string(), "a::b".to_string()],
                 key_is_expression: Vec::new(),
@@ -9582,6 +10522,7 @@ mod tests {
                     target_ddl: None,
                     source_table_comment: None,
                     target_table_comment: None,
+                    table_charset: None,
                     sync_sql: None,
                 }],
                 &[],
@@ -9667,6 +10608,10 @@ mod tests {
                 diff_type: "modified".to_string(),
                 name: "idx_orders_status".to_string(),
                 source: Some(index(IndexInfo {
+                    owner: None,
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name: "idx_orders_status".to_string(),
                     columns: vec!["status".to_string(), "created_at".to_string()],
                     is_unique: true,
@@ -9706,6 +10651,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         }];
 
@@ -9743,6 +10689,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: Some(Some("用户表".to_string())),
             target_table_comment: Some(Some("Users".to_string())),
+            table_charset: None,
             sync_sql: None,
         }];
 
@@ -9781,6 +10728,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         }];
 
@@ -9828,6 +10776,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         }];
 
@@ -10157,6 +11106,10 @@ mod tests {
                 diff_type: "added".to_string(),
                 name: "idx_orders_status".to_string(),
                 source: Some(index(IndexInfo {
+                    owner: None,
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name: "idx_orders_status".to_string(),
                     columns: vec!["status".to_string()],
                     is_unique: false,
@@ -10179,6 +11132,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         }];
 
@@ -10810,6 +11764,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         }
     }
@@ -10889,6 +11844,10 @@ mod tests {
                     column("User ID", "bigint", None),
                 ],
                 indexes: vec![index(IndexInfo {
+                    owner: None,
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name: "Order Status IDX".to_string(),
                     columns: vec!["Status".to_string()],
                     is_unique: true,
@@ -10955,6 +11914,10 @@ mod tests {
                     column("user-id", "bigint", None),
                 ],
                 indexes: vec![index(IndexInfo {
+                    owner: None,
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name: "status-index".to_string(),
                     columns: vec!["status".to_string()],
                     is_unique: true,
@@ -11011,6 +11974,10 @@ mod tests {
                     column("parent id", "TEXT", None),
                 ],
                 indexes: vec![index(IndexInfo {
+                    owner: None,
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name: "active status index".to_string(),
                     columns: vec!["status".to_string()],
                     is_unique: false,
@@ -11131,6 +12098,7 @@ mod tests {
                     valid: None,
                     comment: None,
                     created_at: None,
+                    oracle_metadata: None,
                     statement: None,
                 }],
                 ddl: None,
@@ -11168,6 +12136,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         }];
 
@@ -11620,6 +12589,66 @@ mod tests {
     }
 
     #[test]
+    fn kingbase_agent_generation_metadata_survives_added_column_ddl() {
+        for clause in [
+            "GENERATED ALWAYS AS ((quantity * price)) STORED",
+            "GENERATED ALWAYS AS IDENTITY",
+            "GENERATED BY DEFAULT AS IDENTITY",
+            "IDENTITY(10,5)",
+        ] {
+            let column: ColumnInfo = serde_json::from_value(serde_json::json!({
+                "name": "value", "data_type": "integer", "is_nullable": false,
+                "column_default": null, "is_primary_key": false, "extra": clause
+            }))
+            .unwrap();
+            assert_eq!(
+                column_def(&column, DatabaseType::Kingbase, None),
+                format!("\"value\" integer {clause} NOT NULL")
+            );
+            let (ddl, missing) = generate_create_table_sql(
+                "orders",
+                &[ColumnDiff {
+                    diff_type: "added".to_string(),
+                    name: column.name.clone(),
+                    source: Some(column.clone()),
+                    target: None,
+                    changes: vec![],
+                    add_position: None,
+                }],
+                &[],
+                &[],
+                None,
+                DatabaseType::Kingbase,
+                Some("public"),
+                Some(DialectKind::Postgres),
+                &[],
+                &[],
+            );
+            assert!(missing.is_empty());
+            assert!(ddl.contains(&format!("{clause} NOT NULL")), "{ddl}");
+            assert!(!ddl.contains(" DEFAULT nextval"), "{ddl}");
+        }
+    }
+
+    #[test]
+    fn kingbase_generation_preservation_does_not_change_other_dialects() {
+        let mut column = column("value", "integer", None);
+        column.extra = Some("GENERATED ALWAYS AS (price * quantity) STORED".to_string());
+        for database_type in
+            [DatabaseType::Postgres, DatabaseType::Mysql, DatabaseType::Oracle, DatabaseType::SqlServer]
+        {
+            assert!(kingbase_generation_clause(&column, database_type, None).is_none());
+        }
+        for source in [DialectKind::Mysql, DialectKind::Oracle, DialectKind::SqlServer] {
+            assert!(kingbase_generation_clause(&column, DatabaseType::Kingbase, Some(source)).is_none());
+        }
+        column.column_default = Some("nextval('legacy_sequence')".to_string());
+        let definition = column_def(&column, DatabaseType::Kingbase, None);
+        assert!(definition.contains("GENERATED ALWAYS AS (price * quantity) STORED"));
+        assert!(!definition.contains("legacy_sequence"), "{definition}");
+    }
+
+    #[test]
     fn sqlserver_add_column_places_identity_after_type() {
         let mut source = column("seq", "int", None);
         source.extra = Some("auto_increment".to_string());
@@ -11716,6 +12745,57 @@ mod tests {
     }
 
     #[test]
+    fn mysql_json_default_sync_restores_expression_syntax() {
+        use sqlparser::{dialect::MySqlDialect, parser::Parser};
+
+        let target = vec![column("pass_attr_list", "json", Some("途径点属性，路径规划使用"))];
+        for value in [r"_utf8mb4\'[0]\'", "_utf8mb4'[0]'", "(_utf8mb4'[0]')"] {
+            let source = vec![ColumnInfo {
+                column_default: Some(value.into()),
+                extra: Some("DEFAULT_GENERATED".into()),
+                ..target[0].clone()
+            }];
+            let diffs = diff_columns_with_options(&source, &target, false, false, false, 0.5);
+            assert_eq!(diffs.len(), 1);
+            assert_eq!(diffs[0].changes.len(), 1);
+            assert!(diffs[0].changes[0].starts_with("default:"));
+
+            for db_type in [DatabaseType::Mysql, DatabaseType::Goldendb] {
+                let sql = generate_schema_sync_sql(
+                    &[wrap_table_diff("place_station", diffs.clone())],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    db_type,
+                    Some("idms"),
+                    false,
+                    None,
+                    &[],
+                );
+                assert!(sql.contains("ALTER TABLE `idms`.`place_station`"), "{sql}");
+                assert!(
+                    sql.contains(
+                        "MODIFY COLUMN `pass_attr_list` json NOT NULL DEFAULT (_utf8mb4'[0]') COMMENT '途径点属性，路径规划使用'"
+                    ),
+                    "{value}: {sql}"
+                );
+                Parser::parse_sql(&MySqlDialect {}, &sql).expect("generated ALTER must be valid MySQL syntax");
+            }
+
+            // The same renderer is used for ADD COLUMN and reconstructed CREATE TABLE.
+            let added = diff_columns_with_options(&source, &[], false, false, false, 0.5);
+            for diff_type in ["modified", "added"] {
+                let mut table = wrap_table_diff("place_station", added.clone());
+                table.diff_type = diff_type.into();
+                let sql = gen_sql(table, DatabaseType::Mysql, None);
+                assert!(sql.contains("DEFAULT (_utf8mb4'[0]')"), "{diff_type}: {sql}");
+                Parser::parse_sql(&MySqlDialect {}, &sql).expect("generated ADD/CREATE must be valid MySQL syntax");
+            }
+        }
+    }
+
+    #[test]
     fn default_value_change_postgres() {
         let source = vec![ColumnInfo { column_default: Some("'guest'".into()), ..column("name", "varchar(50)", None) }];
         let target = vec![ColumnInfo { column_default: None, ..column("name", "varchar(50)", None) }];
@@ -11773,9 +12853,9 @@ mod tests {
         // so a column declared `DEFAULT 'a(b)'` stops emitting invalid
         // `DEFAULT a(b)`.
         assert_eq!(default_literal("a(b)", "varchar(32)", Mysql, None), "'a(b)'");
-        assert_eq!(default_literal("uuid()", "varchar(36)", Mysql, Some("DEFAULT_GENERATED")), "uuid()");
-        // MySQL wraps an expression default in parentheses and reports it that
-        // way, so the wrapping identifies it even when EXTRA is missing. That is
+        assert_eq!(default_literal("uuid()", "varchar(36)", Mysql, Some("DEFAULT_GENERATED")), "(uuid())");
+        // DDL-derived metadata may preserve an expression's parentheses, so the
+        // wrapping identifies it even when EXTRA is missing. That is
         // a different question from whether the value contains a parenthesis,
         // which is what `a(b)` above turns on.
         assert_eq!(default_literal("(uuid())", "varchar(36)", Mysql, None), "(uuid())");
@@ -12138,6 +13218,10 @@ mod tests {
                 diff_type: "added".to_string(),
                 name: "idx_name".to_string(),
                 source: Some(index(IndexInfo {
+                    owner: None,
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name: "idx_name".to_string(),
                     columns: vec!["name2".to_string()],
                     is_unique: false,
@@ -12160,6 +13244,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         };
         let sql =
@@ -12183,6 +13268,10 @@ mod tests {
                 name: "idx_old".to_string(),
                 source: None,
                 target: Some(index(IndexInfo {
+                    owner: None,
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name: "idx_old".to_string(),
                     columns: vec!["name".to_string()],
                     is_unique: false,
@@ -12204,6 +13293,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         };
         let sql =
@@ -12302,6 +13392,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         }];
         let dep_graph = DependencyGraph::build(&[], &[]);
@@ -12335,6 +13426,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         }];
         let dep_graph = DependencyGraph::build(&[], &[]);
@@ -12409,6 +13501,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: Some(Some("new".to_string())),
             target_table_comment: Some(Some("old".to_string())),
+            table_charset: None,
             sync_sql: None,
         };
         let sql =
@@ -12546,6 +13639,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: Some(Some("新表".to_string())),
             target_table_comment: Some(Some("旧表".to_string())),
+            table_charset: None,
             sync_sql: None,
         };
         let sql =
@@ -12602,6 +13696,10 @@ mod tests {
     fn index_type_diff_btree_vs_hash() {
         let diffs = diff_indexes(
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["a".into()],
                 is_unique: false,
@@ -12616,6 +13714,10 @@ mod tests {
                 constraint_backed: false,
             })],
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["a".into()],
                 is_unique: false,
@@ -12638,6 +13740,10 @@ mod tests {
     fn index_type_fulltext_detected() {
         let diffs = diff_indexes(
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["content".into()],
                 is_unique: false,
@@ -12652,6 +13758,10 @@ mod tests {
                 constraint_backed: false,
             })],
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["content".into()],
                 is_unique: false,
@@ -12674,6 +13784,10 @@ mod tests {
     fn index_column_order_different() {
         let diffs = diff_indexes(
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["a".into(), "b".into()],
                 is_unique: false,
@@ -12688,6 +13802,10 @@ mod tests {
                 constraint_backed: false,
             })],
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["b".into(), "a".into()],
                 is_unique: false,
@@ -12711,6 +13829,10 @@ mod tests {
     fn index_included_columns_diff() {
         let diffs = diff_indexes(
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["a".into()],
                 is_unique: true,
@@ -12725,6 +13847,10 @@ mod tests {
                 constraint_backed: false,
             })],
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["a".into()],
                 is_unique: true,
@@ -12747,6 +13873,10 @@ mod tests {
     fn index_included_columns_added() {
         let diffs = diff_indexes(
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["a".into()],
                 is_unique: true,
@@ -12761,6 +13891,10 @@ mod tests {
                 constraint_backed: false,
             })],
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["a".into()],
                 is_unique: true,
@@ -12783,6 +13917,10 @@ mod tests {
     fn index_filter_change() {
         let diffs = diff_indexes(
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["status".into()],
                 is_unique: false,
@@ -12797,6 +13935,10 @@ mod tests {
                 constraint_backed: false,
             })],
             &[index(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_t".into(),
                 columns: vec!["status".into()],
                 is_unique: false,
@@ -12821,6 +13963,10 @@ mod tests {
         let diffs = diff_indexes(
             &[
                 index(IndexInfo {
+                    owner: None,
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name: "idx_new".into(),
                     columns: vec!["a".into()],
                     is_unique: true,
@@ -12835,6 +13981,10 @@ mod tests {
                     constraint_backed: false,
                 }),
                 index(IndexInfo {
+                    owner: None,
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name: "idx_modified".into(),
                     columns: vec!["a".into(), "b".into()],
                     is_unique: false,
@@ -12851,6 +14001,10 @@ mod tests {
             ],
             &[
                 index(IndexInfo {
+                    owner: None,
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name: "idx_removed".into(),
                     columns: vec!["c".into()],
                     is_unique: false,
@@ -12865,6 +14019,10 @@ mod tests {
                     constraint_backed: false,
                 }),
                 index(IndexInfo {
+                    owner: None,
+                    key_directions: Vec::new(),
+                    visibility: None,
+                    key_metadata_complete: false,
                     name: "idx_modified".into(),
                     columns: vec!["a".into()],
                     is_unique: true,
@@ -12991,6 +14149,85 @@ mod tests {
         assert!(diffs[0].changes.iter().any(|change| change == "update: NO ACTION → CASCADE"));
     }
 
+    fn mysql_fk_action_options(
+        database_type: DatabaseType,
+        dialect: Option<DialectKind>,
+        source_actions: (Option<&str>, Option<&str>),
+        target_actions: (Option<&str>, Option<&str>),
+    ) -> SchemaDiffPreparationOptions {
+        let detail = |(on_update, on_delete): (Option<&str>, Option<&str>)| TableSchemaDetail {
+            name: "purchase_order_amendment".to_string(),
+            columns: vec![column("id_purchase_order", "int unsigned", None)],
+            indexes: Vec::new(),
+            foreign_keys: vec![foreign_key(ForeignKeyInfo {
+                name: "purchase_order_amendment_id_purchase_order_foreign".into(),
+                column: "id_purchase_order".into(),
+                ref_schema: None,
+                ref_table: "purchase_order".into(),
+                ref_column: "id".into(),
+                on_update: on_update.map(str::to_string),
+                on_delete: on_delete.map(str::to_string),
+            })],
+            triggers: Vec::new(),
+            ddl: None,
+        };
+        SchemaDiffPreparationOptions {
+            source_tables: vec![table_info("purchase_order_amendment", "TABLE")],
+            target_tables: vec![table_info("purchase_order_amendment", "TABLE")],
+            source_details: vec![detail(source_actions)],
+            target_details: vec![detail(target_actions)],
+            database_type,
+            source_dialect: dialect,
+            target_dialect: dialect,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mysql_fk_restrict_and_no_action_are_equivalent() {
+        let cases = [
+            ((Some("NO ACTION"), Some("RESTRICT")), (Some("RESTRICT"), Some("RESTRICT"))),
+            ((Some("restrict"), Some("NO ACTION")), (Some("NO ACTION"), Some("RESTRICT"))),
+            ((None, None), (Some("RESTRICT"), Some("NO ACTION"))),
+            ((Some(""), Some("RESTRICT")), (Some("NO ACTION"), None)),
+        ];
+        for (source, target) in cases {
+            let result = prepare_schema_diff(mysql_fk_action_options(
+                DatabaseType::Mysql,
+                Some(DialectKind::Mysql),
+                source,
+                target,
+            ));
+            assert!(result.diffs.is_empty(), "{source:?} vs {target:?} reported {:?}", result.diffs);
+            assert!(!result.sync_sql.contains("FOREIGN KEY"), "no FK rebuild expected: {}", result.sync_sql);
+        }
+    }
+
+    #[test]
+    fn mysql_fk_real_action_change_is_still_reported() {
+        let result = prepare_schema_diff(mysql_fk_action_options(
+            DatabaseType::Mysql,
+            Some(DialectKind::Mysql),
+            (Some("CASCADE"), Some("SET NULL")),
+            (Some("NO ACTION"), Some("RESTRICT")),
+        ));
+        assert_eq!(result.diffs.len(), 1, "{:?}", result.diffs);
+        let changes = &result.diffs[0].foreign_keys.as_ref().expect("fk diffs")[0].changes;
+        assert!(changes.iter().any(|change| change == "update: NO ACTION → CASCADE"), "{changes:?}");
+        assert!(changes.iter().any(|change| change == "delete: NO ACTION → SET NULL"), "{changes:?}");
+    }
+
+    #[test]
+    fn postgres_fk_restrict_and_no_action_remain_distinct() {
+        let result = prepare_schema_diff(mysql_fk_action_options(
+            DatabaseType::Postgres,
+            Some(DialectKind::Postgres),
+            (Some("NO ACTION"), Some("RESTRICT")),
+            (Some("RESTRICT"), Some("RESTRICT")),
+        ));
+        assert_eq!(result.diffs.len(), 1, "PostgreSQL NO ACTION is deferrable, unlike RESTRICT");
+    }
+
     #[test]
     fn modified_foreign_key_sql_preserves_reference_schema_and_actions() {
         let table_diff = TableDiff {
@@ -13023,6 +14260,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         };
         let sql = generate_schema_sync_sql(
@@ -13244,6 +14482,10 @@ mod tests {
                     diff_type: "added".to_string(),
                     name: "idx_name".into(),
                     source: Some(index(IndexInfo {
+                        owner: None,
+                        key_directions: Vec::new(),
+                        visibility: None,
+                        key_metadata_complete: false,
                         name: "idx_name".into(),
                         columns: vec!["name2".into()],
                         is_unique: false,
@@ -13265,6 +14507,10 @@ mod tests {
                     name: "idx_old".into(),
                     source: None,
                     target: Some(index(IndexInfo {
+                        owner: None,
+                        key_directions: Vec::new(),
+                        visibility: None,
+                        key_metadata_complete: false,
                         name: "idx_old".into(),
                         columns: vec!["name".into()],
                         is_unique: false,
@@ -13315,6 +14561,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         };
         let sql =
@@ -13564,6 +14811,7 @@ mod tests {
             target_details: vec![],
             source_functions: vec![],
             target_functions: vec![],
+            oracle_routines: None,
             source_sequences: vec![],
             target_sequences: vec![],
             source_rules: vec![],
@@ -13682,6 +14930,10 @@ mod tests {
             diff_type: "added".into(),
             name: "idx_del_flag".into(),
             source: Some(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_del_flag".into(),
                 columns: vec!["del_flag".into()],
                 is_unique: false,
@@ -13868,6 +15120,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         }
     }
@@ -13972,6 +15225,10 @@ mod tests {
             diff_type: "added".into(),
             name: "idx_views".into(),
             source: Some(IndexInfo {
+                owner: None,
+                key_directions: Vec::new(),
+                visibility: None,
+                key_metadata_complete: false,
                 name: "idx_views".into(),
                 columns: vec!["views".into()],
                 is_unique: false,
@@ -14012,6 +15269,7 @@ mod tests {
                     target_ddl: None,
                     source_table_comment: None,
                     target_table_comment: None,
+                    table_charset: None,
                     sync_sql: None,
                 };
                 let sql = generate_schema_sync_sql(&[td], &[], &[], &[], &[], db, None, false, src_dialect, &[]);
@@ -14099,6 +15357,7 @@ mod tests {
                     target_ddl: None,
                     source_table_comment: None,
                     target_table_comment: None,
+                    table_charset: None,
                     sync_sql: None,
                 };
                 let sql = generate_schema_sync_sql(&[td], &[], &[], &[], &[], db, None, false, src_dialect, &[]);
@@ -14158,6 +15417,7 @@ mod tests {
                 target_ddl: None,
                 source_table_comment: None,
                 target_table_comment: None,
+                table_charset: None,
                 sync_sql: None,
             };
             let sql = generate_schema_sync_sql(&[td], &[], &[], &[], &[], db, None, false, None, &[]);
@@ -14212,6 +15472,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         };
         let sql = generate_schema_sync_sql(&[td], &[], &[], &[], &[], db, None, false, Some(src), &[]);
@@ -14263,6 +15524,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         };
         let sql = generate_schema_sync_sql(&[td], &[], &[], &[], &[], db, None, false, Some(src), &[]);
@@ -14313,6 +15575,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         };
         let sql = generate_schema_sync_sql(&[td], &[], &[], &[], &[], db, None, false, Some(src), &[]);
@@ -14361,6 +15624,7 @@ mod tests {
             target_ddl: None,
             source_table_comment: None,
             target_table_comment: None,
+            table_charset: None,
             sync_sql: None,
         };
         let sql = generate_schema_sync_sql(
@@ -15013,6 +16277,7 @@ mod tests {
     fn postgres_function_sequence_rule_owner_use_profile_templates() {
         let fn_diff = FunctionDiff {
             diff_type: "added".into(),
+            program_kind: None,
             name: "f1".into(),
             source: Some(FunctionInfo {
                 name: "f1".into(),
@@ -15083,6 +16348,7 @@ mod tests {
     fn postgres_function_sync_reuses_native_functiondef_header_once() {
         let function = |arguments: &str, definition: &str| FunctionDiff {
             diff_type: "added".into(),
+            program_kind: None,
             name: "armor".into(),
             source: Some(FunctionInfo {
                 name: "armor".into(),
@@ -15128,6 +16394,7 @@ mod tests {
     fn mysql_skips_function_sequence_when_templates_absent() {
         let fn_diff = FunctionDiff {
             diff_type: "added".into(),
+            program_kind: None,
             name: "f1".into(),
             source: Some(FunctionInfo {
                 name: "f1".into(),
@@ -15390,6 +16657,10 @@ mod tests {
 
     fn named_index(name: &str, columns: &[&str], is_unique: bool) -> IndexInfo {
         index(IndexInfo {
+            owner: None,
+            key_directions: Vec::new(),
+            visibility: None,
+            key_metadata_complete: false,
             name: name.to_string(),
             columns: columns.iter().map(|column| (*column).to_string()).collect(),
             is_unique,
@@ -15797,6 +17068,62 @@ mod tests {
     }
 
     #[test]
+    fn added_oracle_table_native_ddl_moves_dependent_statements_to_target_schema() {
+        // Issue #12048: only the CREATE TABLE head moved to the target schema, so the
+        // appended index and comments, and the foreign key, still named the source schema.
+        let ddl = [
+            "CREATE TABLE \"MESDEMO\".\"YZCM_F\" ",
+            "   (\t\"ID\" NUMBER, ",
+            "\t\"PID\" NUMBER, ",
+            "\t\"OID\" NUMBER, ",
+            "\t CONSTRAINT \"PK_YZCM_F\" PRIMARY KEY (\"ID\") ENABLE, ",
+            "\t CONSTRAINT \"FK_YZCM_F_P\" FOREIGN KEY (\"PID\")",
+            "\t  REFERENCES \"MESDEMO\".\"YZCM_P\" (\"ID\") ENABLE, ",
+            "\t CONSTRAINT \"FK_YZCM_F_O\" FOREIGN KEY (\"OID\")",
+            "\t  REFERENCES \"SHARED\".\"ORGS\" (\"ID\") ENABLE",
+            "   ) TABLESPACE \"USERS\";",
+            "",
+            "CREATE INDEX \"MESDEMO\".\"IDX_YZCM_F_PID\" ON \"MESDEMO\".\"YZCM_F\" (\"PID\") ",
+            "  TABLESPACE \"USERS\";",
+            "",
+            "-- copied from \"MESDEMO\".\"YZCM_F\"",
+            "COMMENT ON TABLE \"MESDEMO\".\"YZCM_F\" IS 'mirrors \"MESDEMO\".\"YZCM_F\"';",
+            "",
+            "COMMENT ON COLUMN \"MESDEMO\".\"YZCM_F\".\"PID\" IS 'parent id'",
+        ]
+        .join("\n");
+        let diffs = vec![TableDiff {
+            diff_type: "added".to_string(),
+            object_type: Some("table".to_string()),
+            name: "YZCM_F".to_string(),
+            ddl: Some(ddl),
+            ..TableDiff::default()
+        }];
+
+        let sql = generate_schema_sync_sql(
+            &diffs,
+            &[],
+            &[],
+            &[],
+            &[],
+            DatabaseType::Oracle,
+            Some("MESDATA"),
+            false,
+            Some(DialectKind::Oracle),
+            &[],
+        );
+
+        assert!(sql.contains("CREATE TABLE MESDATA.YZCM_F"), "{sql}");
+        assert!(sql.contains("REFERENCES MESDATA.\"YZCM_P\""), "{sql}");
+        assert!(sql.contains("CREATE INDEX MESDATA.\"IDX_YZCM_F_PID\" ON MESDATA.\"YZCM_F\""), "{sql}");
+        assert!(sql.contains("COMMENT ON TABLE MESDATA.\"YZCM_F\" IS 'mirrors \"MESDEMO\".\"YZCM_F\"'"), "{sql}");
+        assert!(sql.contains("COMMENT ON COLUMN MESDATA.\"YZCM_F\".\"PID\""), "{sql}");
+        assert!(sql.contains("REFERENCES \"SHARED\".\"ORGS\""), "{sql}");
+        assert!(sql.contains("-- copied from \"MESDEMO\".\"YZCM_F\""), "{sql}");
+        assert_eq!(sql.matches("\"MESDEMO\".").count(), 2, "only the literal and the comment keep it: {sql}");
+    }
+
+    #[test]
     fn uniqueidentifier_and_uuid_cross_dialect_equivalence() {
         assert!(column_types_equal_for_dialects(
             "uniqueidentifier",
@@ -15812,5 +17139,58 @@ mod tests {
         ));
         assert_eq!(column_type_similarity_score("uniqueidentifier", "uuid"), 1.0);
         assert_eq!(column_type_similarity_score("uuid", "uniqueidentifier"), 1.0);
+    }
+
+    #[test]
+    fn postgres_temporal_default_precision_is_not_a_type_difference() {
+        let pg = Some(DialectKind::Postgres);
+        for (implicit, explicit) in [
+            ("timestamp without time zone", "timestamp(6) without time zone"),
+            ("timestamp with time zone", "timestamp(6) with time zone"),
+            ("time without time zone", "time(6) without time zone"),
+            ("time with time zone", "time(6) with time zone"),
+            ("interval", "interval(6)"),
+            ("interval day to second", "interval day to second(6)"),
+            ("timestamp without time zone[]", "timestamp(6) without time zone[]"),
+        ] {
+            assert!(column_types_equal_for_dialects(implicit, explicit, pg, pg), "{implicit} vs {explicit}");
+            assert!(column_types_equal_for_dialects(explicit, implicit, pg, pg), "{explicit} vs {implicit}");
+        }
+
+        assert!(!column_types_equal_for_dialects(
+            "timestamp without time zone",
+            "timestamp(3) without time zone",
+            pg,
+            pg
+        ));
+        assert!(!column_types_equal_for_dialects(
+            "timestamp(6) without time zone",
+            "timestamp(6) with time zone",
+            pg,
+            pg
+        ));
+        assert!(!column_types_equal_for_dialects("numeric", "numeric(6)", pg, pg));
+    }
+
+    #[test]
+    fn postgres_timestamp_default_precision_produces_no_column_diff() {
+        let column = |data_type: &str| ColumnInfo {
+            name: "created_at".into(),
+            data_type: data_type.into(),
+            is_nullable: false,
+            column_default: Some("now()".into()),
+            ..Default::default()
+        };
+        let diffs = diff_columns_with_dialect_options(
+            &[column("timestamp without time zone")],
+            &[column("timestamp(6) without time zone")],
+            false,
+            false,
+            false,
+            0.5,
+            Some(DialectKind::Postgres),
+            Some(DialectKind::Postgres),
+        );
+        assert!(diffs.is_empty(), "{diffs:?}");
     }
 }

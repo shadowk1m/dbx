@@ -2,18 +2,20 @@ use std::sync::Arc;
 
 use dbx_core::cloud_sync::{
     apply_sync_snapshot_with_selection, build_sync_snapshot_with_selection, describe_local_sync_state,
-    describe_sync_snapshot, finalize_snippet_migration, forget_snippet_token, forget_webdav_password,
-    forget_webdav_sync_secrets_passphrase as core_forget_webdav_sync_secrets_passphrase, resolve_snippet_token,
-    resolve_webdav_password, resolve_webdav_sync_secrets_passphrase, retry_pending_snippet_cleanup,
+    describe_sync_snapshot, finalize_snippet_migration, forget_snippet_passphrase, forget_snippet_token,
+    forget_webdav_password, forget_webdav_sync_secrets_passphrase as core_forget_webdav_sync_secrets_passphrase,
+    resolve_snippet_passphrase, resolve_snippet_token, resolve_webdav_password, resolve_webdav_sync_secrets_passphrase,
+    retry_pending_snippet_cleanup, save_snippet_passphrase,
     save_snippet_sync_id_for_instance as core_save_snippet_sync_id, save_snippet_token, save_webdav_password,
-    save_webdav_sync_secrets_preference as core_save_webdav_sync_secrets_preference, snippet_saved_token_status,
-    snippet_sync_settings_for_instance as core_snippet_sync_settings, webdav_saved_password_status,
-    webdav_sync_secrets_status as core_webdav_sync_secrets_status, ApplySnapshotOptions, ApplySnapshotSummary,
-    SnippetProvider, SnippetSyncClient, SnippetSyncConfig, SnippetSyncSettings, SnippetSyncSummary, SnippetTokenStatus,
-    SyncExportOptions, SyncSelection, SyncSnapshotCatalog, WebDavClient, WebDavConfig, WebDavPasswordStatus,
-    WebDavSyncSecretsStatus, WebDavSyncSummary,
+    save_webdav_sync_secrets_preference as core_save_webdav_sync_secrets_preference, snippet_saved_passphrase_status,
+    snippet_saved_token_status, snippet_sync_settings_for_instance as core_snippet_sync_settings,
+    webdav_saved_password_status, webdav_sync_secrets_status as core_webdav_sync_secrets_status, ApplySnapshotOptions,
+    ApplySnapshotSummary, SnippetPassphraseStatus, SnippetProvider, SnippetSyncClient, SnippetSyncConfig,
+    SnippetSyncSettings, SnippetSyncSummary, SnippetTokenStatus, SyncExportOptions, SyncSelection, SyncSnapshotCatalog,
+    WebDavClient, WebDavConfig, WebDavPasswordStatus, WebDavSyncSecretsStatus, WebDavSyncSummary,
 };
 use dbx_core::storage::DesktopSettings;
+use dbx_core::storage::{CredentialResetFailure, CredentialResetPreparation, CredentialResetReport};
 use dbx_core::storage::{MigrationPreflight, MigrationReport};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -41,13 +43,18 @@ pub struct SnippetDownloadResult {
 #[tauri::command]
 pub async fn migration_status(
     state: State<'_, Arc<AppState>>,
+    gate: State<'_, Arc<crate::migration_gate::MigrationGate>>,
     retry: Option<bool>,
 ) -> Result<MigrationPreflight, String> {
-    if retry.unwrap_or(false) {
+    let result = if retry.unwrap_or(false) {
         state.storage.retry_data_migration_inspection().await
     } else {
         state.storage.inspect_data_migration().await
-    }
+    };
+    // Restoring the original key must release the native gate too, not just
+    // hide the frontend recovery screen.
+    gate.set_ready(result.as_ref().is_ok_and(|status| status.is_ready()));
+    result
 }
 
 #[tauri::command]
@@ -73,6 +80,27 @@ pub async fn migration_retry(
 #[tauri::command]
 pub async fn migration_cleanup_backups(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.storage.cleanup_migration_backups().await
+}
+
+#[tauri::command]
+pub async fn migration_prepare_credential_reset(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CredentialResetPreparation, CredentialResetFailure> {
+    state.storage.prepare_credential_reset().await
+}
+
+#[tauri::command]
+pub async fn migration_reset_credentials(
+    state: State<'_, Arc<AppState>>,
+    gate: State<'_, Arc<crate::migration_gate::MigrationGate>>,
+    confirmation_token: String,
+    confirmed: bool,
+) -> Result<CredentialResetReport, CredentialResetFailure> {
+    gate.set_ready(false);
+    let result = state.storage.reset_credentials(confirmation_token, confirmed).await;
+    // A successful reset still needs the regular startup initialization. The
+    // frontend's subsequent status check drives the existing startup flow.
+    result
 }
 
 #[tauri::command]
@@ -248,6 +276,31 @@ pub async fn forget_snippet_saved_token(
 }
 
 #[tauri::command]
+pub async fn snippet_passphrase_status(
+    state: State<'_, Arc<AppState>>,
+    config: SnippetSyncConfig,
+) -> Result<SnippetPassphraseStatus, String> {
+    snippet_saved_passphrase_status(&state.storage, &config).await
+}
+
+#[tauri::command]
+pub async fn save_snippet_saved_passphrase(
+    state: State<'_, Arc<AppState>>,
+    config: SnippetSyncConfig,
+    passphrase: String,
+) -> Result<(), String> {
+    save_snippet_passphrase(&state.storage, &config, &passphrase).await
+}
+
+#[tauri::command]
+pub async fn forget_snippet_saved_passphrase(
+    state: State<'_, Arc<AppState>>,
+    config: SnippetSyncConfig,
+) -> Result<(), String> {
+    forget_snippet_passphrase(&state.storage, &config).await
+}
+
+#[tauri::command]
 pub async fn snippet_sync_settings(
     state: State<'_, Arc<AppState>>,
     provider: SnippetProvider,
@@ -286,8 +339,10 @@ pub async fn snippet_sync_upload(
     include_secrets: bool,
     secrets_passphrase: Option<String>,
     selection: Option<SyncSelection>,
+    expected_remote_content_hash: Option<String>,
 ) -> Result<SnippetSyncSummary, String> {
     resolve_snippet_token(&state.storage, &mut config).await?;
+    let snippet_passphrase = resolve_snippet_passphrase(&state.storage, &config, snippet_passphrase.as_deref()).await?;
     let secrets_passphrase = if include_secrets {
         Some(
             secrets_passphrase
@@ -315,7 +370,14 @@ pub async fn snippet_sync_upload(
     )
     .await?;
     let client = SnippetSyncClient::new(config)?;
-    let mut summary = client.put_snapshot(&snapshot, snippet_passphrase.as_deref(), secrets_passphrase).await?;
+    let mut summary = client
+        .put_snapshot_with_expected_remote_hash(
+            &snapshot,
+            snippet_passphrase.as_deref(),
+            secrets_passphrase,
+            expected_remote_content_hash.as_deref(),
+        )
+        .await?;
     finalize_snippet_migration(&state.storage, &client, &mut summary).await?;
     Ok(summary)
 }
@@ -330,6 +392,7 @@ pub async fn snippet_sync_download(
     selection: Option<SyncSelection>,
 ) -> Result<SnippetDownloadResult, String> {
     resolve_snippet_token(&state.storage, &mut config).await?;
+    let snippet_passphrase = resolve_snippet_passphrase(&state.storage, &config, snippet_passphrase.as_deref()).await?;
     let (snapshot, summary) = SnippetSyncClient::new(config)?.get_snapshot(snippet_passphrase.as_deref()).await?;
     let apply_summary = apply_sync_snapshot_with_selection(
         &state.storage,
@@ -355,6 +418,7 @@ pub async fn snippet_sync_inspect(
     secrets_passphrase: Option<String>,
 ) -> Result<SyncSnapshotCatalog, String> {
     resolve_snippet_token(&state.storage, &mut config).await?;
+    let snippet_passphrase = resolve_snippet_passphrase(&state.storage, &config, snippet_passphrase.as_deref()).await?;
     let (snapshot, _) = SnippetSyncClient::new(config)?.get_snapshot(snippet_passphrase.as_deref()).await?;
     let explicit = secrets_passphrase.as_deref().map(str::trim).filter(|value| !value.is_empty());
     let saved = if explicit.is_none() { resolve_webdav_sync_secrets_passphrase(&state.storage).await? } else { None };

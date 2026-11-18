@@ -33,6 +33,9 @@ fn send_transfer_progress(channel: &TransferProgressChannel, progress: &transfer
 
 fn terminal_transfer_error(req: &TransferRequest, error: impl ToString) -> transfer::TransferProgress {
     transfer::TransferProgress {
+        oracle_package_approval: None,
+        oracle_package_preflight: None,
+        oracle_routine_operation: None,
         transfer_id: req.transfer_id.clone(),
         table: String::new(),
         table_index: 0,
@@ -64,6 +67,7 @@ async fn finish_transfer_channel(state: &Arc<WebState>, transfer_id: &str, chann
 #[serde(rename_all = "camelCase")]
 pub struct StartTransferRequest {
     pub request: TransferRequest,
+    pub operation_timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -82,8 +86,11 @@ pub async fn start_transfer(
     State(state): State<Arc<WebState>>,
     Json(body): Json<StartTransferRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let operation_timeout_secs = body.operation_timeout_secs;
     let req = body.request;
+    transfer::check_data_charset_transfer(&state.app, &req).await.map_err(AppError::from)?;
     transfer::validate_transfer_request(&req).map_err(AppError::from)?;
+    transfer::validate_transfer_operation_timeout(operation_timeout_secs).map_err(AppError::from)?;
 
     // Demo mode skips connection-backed validation: the simulated web build may not
     // carry the requested connections, and the spawned task reports failures as
@@ -188,7 +195,12 @@ pub async fn start_transfer(
             }
         };
 
-        if let Err(error) = transfer::ensure_transfer_source_types_supported(&app, &req, &source_pool_key).await {
+        if let Err(error) = transfer::with_transfer_operation_timeout(
+            operation_timeout_secs,
+            transfer::ensure_transfer_source_types_supported(&app, &req, &source_pool_key),
+        )
+        .await
+        {
             send_transfer_progress(&progress_channel, &terminal_transfer_error(&req, error));
             finish_transfer_channel(&state_clone, &req.transfer_id, &progress_channel).await;
             return;
@@ -204,6 +216,7 @@ pub async fn start_transfer(
             source_pool_key,
             target_pool_key,
             history,
+            operation_timeout_secs,
             move |progress| send_transfer_progress(&progress_channel_for_run, &progress),
         )
         .await;
@@ -305,12 +318,14 @@ mod tests {
     use axum::response::IntoResponse;
     use dbx_core::connection::AppState;
     use dbx_core::models::connection::{
-        default_connect_timeout_secs, default_idle_timeout_secs, default_keepalive_interval_secs,
-        default_query_timeout_secs, ConnectionConfig, DatabaseType,
+        default_connect_timeout_secs, default_idle_disconnect_secs, default_idle_timeout_secs,
+        default_keepalive_interval_secs, default_manual_transaction_timeout_secs, default_query_timeout_secs,
+        ConnectionConfig, DatabaseType,
     };
     use dbx_core::persistence::task_history::{TaskRunItemsQuery, TaskRunStatus, TransferObjectSelectionMode};
     use dbx_core::transfer::{
-        TransferContent, TransferMode, TransferOwnershipPolicy, TransferRequest, TransferTableNameCase,
+        TransferColumnNameCase, TransferContent, TransferMode, TransferOwnershipPolicy, TransferRequest,
+        TransferTableNameCase,
     };
 
     fn sqlite_config(id: &str, path: &str) -> ConnectionConfig {
@@ -338,6 +353,8 @@ mod tests {
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
             show_database_links: None,
+            show_native_jobs: None,
+            show_user_admin: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -345,6 +362,8 @@ mod tests {
             connect_timeout_secs: default_connect_timeout_secs(),
             query_timeout_secs: default_query_timeout_secs(),
             idle_timeout_secs: default_idle_timeout_secs(),
+            manual_transaction_timeout_secs: default_manual_transaction_timeout_secs(),
+            idle_disconnect_secs: default_idle_disconnect_secs(),
             keepalive_interval_secs: default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
@@ -412,10 +431,12 @@ mod tests {
             create_table: false,
             drop_target_before_create: false,
             drop_target_confirmed: false,
+            oracle_packages: None,
             content: TransferContent::DataOnly,
             objects: Some(Vec::new()),
             mode: TransferMode::Append,
             target_table_name_case: TransferTableNameCase::Preserve,
+            target_column_name_case: TransferColumnNameCase::Preserve,
             quote_target_column_names: true,
             ownership_policy: TransferOwnershipPolicy::Preserve,
             batch_size: 1000,
@@ -436,12 +457,17 @@ mod tests {
 
         let req = transfer_request("src", "dst", &dir);
         let transfer_id = req.transfer_id.clone();
-        let response = start_transfer(State(state.clone()), Json(StartTransferRequest { request: req })).await.unwrap();
+        let response = start_transfer(
+            State(state.clone()),
+            Json(StartTransferRequest { request: req, operation_timeout_secs: None }),
+        )
+        .await
+        .unwrap();
         let _ = response.into_response();
 
         let duplicate = start_transfer(
             State(state.clone()),
-            Json(StartTransferRequest { request: transfer_request("src", "dst", &dir) }),
+            Json(StartTransferRequest { request: transfer_request("src", "dst", &dir), operation_timeout_secs: None }),
         )
         .await
         .unwrap_err();
@@ -511,7 +537,12 @@ mod tests {
         Arc::get_mut(&mut state).unwrap().demo_mode = true;
         let req = transfer_request("src", "dst", &dir);
         let transfer_id = req.transfer_id.clone();
-        let _ = start_transfer(State(state.clone()), Json(StartTransferRequest { request: req })).await.unwrap();
+        let _ = start_transfer(
+            State(state.clone()),
+            Json(StartTransferRequest { request: req, operation_timeout_secs: None }),
+        )
+        .await
+        .unwrap();
         let channel = {
             let channels = state.transfer_progress_channels.read().await;
             channels.get(&transfer_id).cloned().expect("transfer channel registered")

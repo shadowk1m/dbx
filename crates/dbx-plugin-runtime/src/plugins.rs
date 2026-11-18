@@ -12,6 +12,8 @@ mod host;
 mod installer;
 mod jdbc_sessions;
 mod lifecycle;
+#[cfg(all(test, any(windows, unix)))]
+mod lifecycle_tests;
 mod manifest;
 mod marketplace;
 mod runtime;
@@ -48,7 +50,8 @@ pub use manifest::{
     PluginDriverManifest, PluginEngines, PluginEntrypoints, PluginFieldCondition, PluginFieldConditionClause,
     PluginFieldConditionLiteral, PluginFilesystemCapability, PluginFilesystemProviderContribution,
     PluginFormFieldBinding, PluginFormFieldDefinition, PluginFormFieldOption, PluginFormFieldPicker,
-    PluginFormFieldPickerKind, PluginFormFieldType, PluginManifest, PluginUiEntrypoint, PluginWorkbenchContribution,
+    PluginFormFieldPickerKind, PluginFormFieldType, PluginManifest, PluginMcpAccess, PluginMcpContribution,
+    PluginMcpScope, PluginMcpToolDeclaration, PluginMcpToolset, PluginUiEntrypoint, PluginWorkbenchContribution,
     PLUGIN_CONNECTION_ACTION_METHOD, PLUGIN_CONNECTION_CONNECT_METHOD, PLUGIN_CONNECTION_DISCONNECT_METHOD,
     PLUGIN_CONNECTION_TEST_METHOD, SUPPORTED_PLUGIN_HOST_API_VERSION, SUPPORTED_PLUGIN_HOST_FEATURES,
     SUPPORTED_PLUGIN_MANIFEST_VERSION, SUPPORTED_PLUGIN_PERMISSIONS, SUPPORTED_PLUGIN_PROTOCOL_VERSION,
@@ -167,12 +170,8 @@ impl PluginRegistry {
     }
 
     pub fn new_with_app_version(root_dir: PathBuf, app_version: impl Into<String>) -> Self {
-        Self {
-            root_dir,
-            app_version: app_version.into(),
-            lifecycle: PluginLifecycle::default(),
-            jdbc_runtimes: Default::default(),
-        }
+        let lifecycle = PluginLifecycle::for_store(&root_dir);
+        Self { root_dir, app_version: app_version.into(), lifecycle, jdbc_runtimes: Default::default() }
     }
 
     pub fn lifecycle(&self) -> PluginLifecycle {
@@ -329,9 +328,16 @@ impl PluginRegistry {
     where
         T: DeserializeOwned,
     {
+        let _operation = self.lifecycle.begin_operation(&plugin.manifest.id)?;
+        // A rollback in another host may have completed between discovery and admission.
+        let plugin = self.find_plugin(&plugin.manifest.id)?.ok_or("Plugin is no longer installed")?;
         ensure_plugin_compatible(&plugin)?;
         let env = PluginRuntimeEnv::default().with_plugin_data_dir(&self.plugin_data_dir(&plugin.manifest.id));
-        let session = PluginSidecarSession::start(plugin, self.app_version.clone(), env).await?;
+        let runtime_lease = self.lifecycle.runtime_lease(&plugin.manifest.id)?;
+        let session =
+            PluginSidecarSession::start_with_runtime_lease(plugin, self.app_version.clone(), env, runtime_lease)
+                .await?;
+        let _cleanup = runtime::ShutdownOnDrop::new(session.clone());
         let result =
             session.invoke_with_timeout(method, params, Some(capability_id), Some(PLUGIN_REQUEST_TIMEOUT)).await;
         match (result, session.shutdown().await) {
@@ -386,8 +392,18 @@ impl PluginRegistry {
         // and makes the whole start -> invoke -> shutdown sequence mutually exclusive with an
         // install, rollback, or uninstall of the same plugin.
         let _operation = self.lifecycle.begin_operation(&plugin.manifest.id)?;
+        let current = self.find_driver(driver_id)?.ok_or("Plugin driver is no longer installed")?;
+        if current.manifest.id != plugin.manifest.id {
+            return Err(format!("Plugin driver '{driver_id}' changed. Please reconnect."));
+        }
+        let plugin = current;
+        ensure_plugin_compatible(&plugin)?;
         let env = env.with_plugin_data_dir(&self.plugin_data_dir(&plugin.manifest.id));
-        let session = PluginSidecarSession::start(plugin, self.app_version.clone(), env).await?;
+        let runtime_lease = self.lifecycle.runtime_lease(&plugin.manifest.id)?;
+        let session =
+            PluginSidecarSession::start_with_runtime_lease(plugin, self.app_version.clone(), env, runtime_lease)
+                .await?;
+        let _cleanup = runtime::ShutdownOnDrop::new(session.clone());
         let result = session.invoke_with_timeout(method, params, Some(driver_id), timeout_duration).await;
         match (result, session.shutdown().await) {
             (Ok(value), Ok(())) => Ok(value),
@@ -484,7 +500,8 @@ impl PluginDriverSession {
         env: PluginRuntimeEnv,
         activity: lifecycle::PluginUsageGuard,
     ) -> Result<Self, String> {
-        let sidecar = PluginSidecarSession::start(plugin, app_version, env).await?;
+        let runtime_lease = activity.runtime_lease()?;
+        let sidecar = PluginSidecarSession::start_with_runtime_lease(plugin, app_version, env, runtime_lease).await?;
         Ok(Self { sidecar, driver_id, _activity: Some(activity), logical: None })
     }
 
@@ -536,6 +553,34 @@ impl PluginDriverSession {
         if let Some(logical) = &self.logical {
             logical.close().await;
             return Ok(());
+        }
+        self.sidecar.shutdown().await
+    }
+
+    /// Confirm JDBC cleanup for an owned native-operation scope. Ordinary shutdown remains best effort.
+    pub async fn shutdown_confirmed(&self) -> Result<(), String> {
+        if let Some(logical) = &self.logical {
+            return logical.close_confirmed().await;
+        }
+        if self.driver_id == "jdbc" {
+            let closed: Result<serde_json::Value, _> = self
+                .sidecar
+                .invoke_with_timeout(
+                    "close",
+                    serde_json::json!({}),
+                    Some(&self.driver_id),
+                    Some(Duration::from_secs(3)),
+                )
+                .await;
+            let acknowledged = closed.and_then(|value| {
+                if value["ok"] == true {
+                    Ok(())
+                } else {
+                    Err("JDBC session cleanup was not confirmed".to_string())
+                }
+            });
+            let stopped = self.sidecar.shutdown().await;
+            return acknowledged.and(stopped);
         }
         self.sidecar.shutdown().await
     }
@@ -609,6 +654,8 @@ impl Drop for PluginDriverSession {
     fn drop(&mut self) {
         if let Some(logical) = &self.logical {
             logical.close_in_background();
+        } else {
+            drop(runtime::ShutdownOnDrop::new(self.sidecar.clone()));
         }
     }
 }

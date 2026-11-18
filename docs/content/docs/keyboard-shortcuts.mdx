@@ -46,6 +46,8 @@ Standard copy and paste still follow platform conventions. Copy Current Row, Del
 
 **Focus WHERE condition** has no default shortcut. Assign your preferred binding in **Settings → Shortcuts → Data grid** to focus the WHERE input in the active table data tab. It keeps the current condition and does not execute a query. It does nothing when the WHERE input is unavailable.
 
+The grid also has two fixed gestures that are not rebindable: pressing `↓` while the cursor is on the last displayed row appends a row at the end of the result (unlike Add Row, which follows the toolbar insert position), and `Esc` inside a cell editor only cancels the current input — with the grid focused, `Esc` removes a new row that was never filled in, otherwise it reverts the selected cell to its original value. See [Data grid](/en/docs/data-grid).
+
 ### Global and Navigation
 
 | Default | Action |
@@ -63,7 +65,9 @@ The sidebar also has configurable actions for copy, paste, edit connection, and 
 
 ## Quick Open
 
-Press `Mod+P` to search connections, databases, schemas, tables, views, and saved SQL in the current workspace. Results come from loaded and searchable objects. For a large connection whose metadata is not loaded yet, expand or refresh the relevant node first.
+Press `Mod+P` to open the global search workbench. It searches connections, databases, schemas, tables, views, materialized views, fields, comments, SQL files, file contents, and plugin commands. Use `kind:`, `db:`, `schema:`, `comment:`, `file:`, `source:`, or `category:` filters to narrow results; `Ctrl/Cmd+1` through `Ctrl/Cmd+8` switches categories. Enter runs the default action shown in the preview, while the secondary shortcut opens the related structure or data view.
+
+Results use loaded metadata and add connected database results when needed. Opening Quick Open does not connect inactive databases, and content search only scans configured local directories. For a large connection whose metadata is not loaded yet, expand or refresh the relevant node first.
 
 ## Customization and Conflicts
 

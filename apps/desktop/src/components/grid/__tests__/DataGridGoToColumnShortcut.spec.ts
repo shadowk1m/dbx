@@ -59,10 +59,12 @@ function mountGrid(
     slots?: Record<string, () => ReturnType<typeof h>>;
     withTableMetadata?: boolean;
     context?: "table-data" | "results";
+    columnLayoutScopeKey?: string;
     queryMultiSource?: boolean;
     databaseType?: DatabaseType;
     sourceDatabase?: string;
     joinedWriteTargetCount?: number;
+    filterControls?: boolean;
   } = {},
 ) {
   const pinia = createPinia();
@@ -83,7 +85,11 @@ function mountGrid(
     hidden_column_indexes: options.displayableColumns === false ? [0] : undefined,
   });
 
-  const grid = ref<{ tableInfoToolbarCapability: DataGridToolbarActionCapability; goToColumnToolbarCapability: DataGridToolbarActionCapability }>();
+  const grid = ref<{
+    tableInfoToolbarCapability: DataGridToolbarActionCapability;
+    goToColumnToolbarCapability: DataGridToolbarActionCapability;
+    moveDisplayableColumn: (fromDisplayableIndex: number, toDisplayableIndex: number) => void;
+  }>();
   const host = document.createElement("div");
   document.body.append(host);
   const Root = defineComponent({
@@ -101,6 +107,8 @@ function mountGrid(
                   result,
                   databaseType: options.databaseType ?? "mysql",
                   context: options.context ?? "table-data",
+                  columnLayoutScopeKey: options.columnLayoutScopeKey,
+                  onExecuteSql: options.filterControls ? async () => undefined : undefined,
                   queryMultiSource: options.queryMultiSource,
                   joinedWriteTargets: options.joinedWriteTargetCount ? Array.from({ length: options.joinedWriteTargetCount }, (_, index) => ({ tableMeta: { tableName: `table_${index}`, columns: [], primaryKeys: [] }, sourceColumns: ["id"] })) : undefined,
                   ...(options.withTableMetadata
@@ -139,16 +147,78 @@ function gridRoot(host: HTMLElement): HTMLElement {
   return root;
 }
 
+function mockToolbarGeometry(geometry: { width: number; filters: number; actions: number; compactActions?: number; leading?: number; conditionInputs?: { where: number; order: number } }) {
+  const observers: Array<{ callback: () => void; elements: Set<Element> }> = [];
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      elements = new Set<Element>();
+      constructor(callback: () => void) {
+        observers.push({ callback, elements: this.elements });
+      }
+      observe(element: Element) {
+        this.elements.add(element);
+      }
+      unobserve(element: Element) {
+        this.elements.delete(element);
+      }
+      disconnect() {
+        this.elements.clear();
+      }
+    },
+  );
+  const isLeading = (element: HTMLElement) => !!element.querySelector("[data-test-toolbar-leading]");
+  const conditionLabelWidth = (element: HTMLElement) => (element.closest("[data-grid-condition-editor]")?.getAttribute("data-grid-condition-editor") === "where" ? 42 : 67);
+
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
+    if (this.hasAttribute("data-grid-condition-input-viewport")) {
+      const kind = this.closest("[data-grid-condition-editor]")?.getAttribute("data-grid-condition-editor") === "where" ? "where" : "order";
+      const compact = !!this.closest("[data-grid-condition-editor]")?.querySelector(".data-grid-topbar-condition-label--compact");
+      return (geometry.conditionInputs?.[kind] ?? 250) + (compact ? conditionLabelWidth(this) : 0);
+    }
+    if (this.classList.contains("data-grid-topbar-condition-label")) return this.classList.contains("data-grid-topbar-condition-label--compact") ? 0 : conditionLabelWidth(this);
+    if (this.classList.contains("data-grid-topbar-shell") || this.dataset.gridTopbarRow === "filters") return geometry.width;
+    if (this.dataset.gridTopbarRow === "actions") return isLeading(this) ? (geometry.leading ?? 0) : Math.max(0, geometry.width - (geometry.leading ?? 0));
+    return 0;
+  });
+  vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockImplementation(function (this: HTMLElement) {
+    if (this.classList.contains("data-grid-topbar-condition-label")) return conditionLabelWidth(this);
+    if (this.classList.contains("data-grid-topbar-shell")) return geometry.width;
+    if (this.dataset.gridTopbarRow === "filters") return this.querySelector(".data-grid-topbar--compact") ? geometry.width : Math.max(geometry.width, geometry.filters);
+    if (this.dataset.gridTopbarRow === "actions") {
+      if (isLeading(this)) return geometry.leading ?? 0;
+      const actions = this.querySelector(".data-grid-topbar-action-label--compact") ? (geometry.compactActions ?? geometry.actions) : geometry.actions;
+      return Math.max(this.clientWidth, actions);
+    }
+    return 0;
+  });
+  return (selector = ".data-grid-topbar-shell") => {
+    for (const observer of observers) {
+      if ([...observer.elements].some((element) => element.matches(selector))) observer.callback();
+    }
+  };
+}
+
 function goToColumnItem(name: string, position: number): HTMLButtonElement {
   const button = [...document.querySelectorAll<HTMLButtonElement>("button")].find((candidate) => candidate.textContent?.replaceAll(/\s/g, "") === `${name}#${position}`);
   if (!button) throw new Error(`Go-to-column item ${name} not found`);
   return button;
 }
 
+function goToColumnOrder(): string[] {
+  return [...document.querySelectorAll<HTMLButtonElement>("[data-column-lookup-panel] button")].map((button) => button.textContent?.replaceAll(/\s/g, "") ?? "").filter((text) => text.includes("#"));
+}
+
 function goToColumnEvent(target: HTMLElement): KeyboardEvent {
   const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ctrlKey: true, key: "g" });
   target.dispatchEvent(event);
   return event;
+}
+
+function dialogButton(label: string): HTMLButtonElement {
+  const button = [...document.querySelectorAll<HTMLButtonElement>("button")].find((candidate) => candidate.textContent?.trim() === label);
+  if (!button) throw new Error(`Dialog button ${label} not found`);
+  return button;
 }
 
 afterEach(() => {
@@ -158,6 +228,7 @@ afterEach(() => {
     app.unmount();
     host.remove();
   }
+  vi.unstubAllGlobals();
 });
 
 describe("DataGrid go-to-column shortcut", () => {
@@ -187,6 +258,101 @@ describe("DataGrid go-to-column shortcut", () => {
     expect(topbar?.dataset.gridToolbarLayout).toBe("split");
     expect(topbar?.classList.contains("grid")).toBe(true);
     expect(host.querySelector('[data-grid-topbar-row="filters"].data-grid-topbar-scroll--row-divider')).not.toBeNull();
+  });
+
+  it("keeps split toolbar labels expanded below the single-row breakpoint and resets layout history", async () => {
+    mockToolbarGeometry({ width: 800, filters: 600, actions: 600 });
+    const { host, settingsStore } = mountGrid();
+    await settle();
+    const refresh = () => host.querySelector<HTMLElement>('[data-toolbar-action="refresh"] .data-grid-topbar-action-label');
+    await vi.waitFor(() => expect(refresh()?.classList.contains("data-grid-topbar-action-label--compact")).toBe(true));
+
+    settingsStore.updateEditorSettings({ dataGridToolbarLayout: "split" });
+    await vi.waitFor(() => expect(refresh()?.classList.contains("data-grid-topbar-action-label--compact")).toBe(false));
+    expect(host.querySelector(".data-grid-topbar--compact")).toBeNull();
+
+    settingsStore.updateEditorSettings({ dataGridToolbarLayout: "single" });
+    await vi.waitFor(() => expect(refresh()?.classList.contains("data-grid-topbar-action-label--compact")).toBe(true));
+    settingsStore.updateEditorSettings({ dataGridToolbarLayout: "split" });
+    await vi.waitFor(() => expect(refresh()?.classList.contains("data-grid-topbar-action-label--compact")).toBe(false));
+  });
+
+  it("compacts split filter controls independently from action labels", async () => {
+    const geometry = { width: 800, filters: 900, actions: 500 };
+    const resize = mockToolbarGeometry(geometry);
+    const { host, settingsStore } = mountGrid();
+    settingsStore.updateEditorSettings({ dataGridToolbarLayout: "split" });
+    await vi.waitFor(() => expect(host.querySelector(".data-grid-topbar--compact")).not.toBeNull());
+    expect(host.querySelector('[data-toolbar-action="refresh"] .data-grid-topbar-action-label--compact')).toBeNull();
+
+    geometry.width = 940;
+    resize();
+    await vi.waitFor(() => expect(host.querySelector(".data-grid-topbar--compact")).toBeNull());
+    expect(host.querySelector('[data-toolbar-action="refresh"] .data-grid-topbar-action-label--compact')).toBeNull();
+  });
+
+  it("measures both split action segments and restores their labels when the pane grows", async () => {
+    const geometry = { width: 700, filters: 500, actions: 650, compactActions: 450, leading: 100 };
+    const resize = mockToolbarGeometry(geometry);
+    const { host, settingsStore } = mountGrid({ slots: { "result-toolbar-leading": () => h("span", { "data-test-toolbar-leading": "" }, "Results") } });
+    settingsStore.updateEditorSettings({ dataGridToolbarLayout: "split" });
+    await vi.waitFor(() => expect(host.querySelector('[data-toolbar-action="refresh"] .data-grid-topbar-action-label--compact')).not.toBeNull());
+    expect(host.querySelector(".data-grid-topbar--compact")).toBeNull();
+
+    geometry.width = 800;
+    resize();
+    await vi.waitFor(() => expect(host.querySelector('[data-toolbar-action="refresh"] .data-grid-topbar-action-label--compact')).toBeNull());
+    expect(host.querySelector(".data-grid-topbar--compact")).toBeNull();
+  });
+
+  it("restores split action labels while the filter row still needs compact controls", async () => {
+    const geometry = { width: 700, filters: 900, actions: 750, compactActions: 450, leading: 100 };
+    const resize = mockToolbarGeometry(geometry);
+    const { host, settingsStore } = mountGrid({ slots: { "result-toolbar-leading": () => h("span", { "data-test-toolbar-leading": "" }, "Results") } });
+    settingsStore.updateEditorSettings({ dataGridToolbarLayout: "split" });
+    await vi.waitFor(() => expect(host.querySelector('[data-toolbar-action="refresh"] .data-grid-topbar-action-label--compact')).not.toBeNull());
+    expect(host.querySelector(".data-grid-topbar--compact")).not.toBeNull();
+
+    geometry.width = 900;
+    resize();
+    await vi.waitFor(() => expect(host.querySelector('[data-toolbar-action="refresh"] .data-grid-topbar-action-label--compact')).toBeNull());
+    expect(host.querySelector(".data-grid-topbar--compact")).not.toBeNull();
+
+    geometry.width = 940;
+    resize();
+    await vi.waitFor(() => expect(host.querySelector(".data-grid-topbar--compact")).toBeNull());
+  });
+
+  it("compacts WHERE and ORDER BY when inputs become too narrow without row overflow", async () => {
+    const geometry = { width: 500, filters: 500, actions: 300, conditionInputs: { where: 150, order: 120 } };
+    const resize = mockToolbarGeometry(geometry);
+    const { host, settingsStore } = mountGrid({ filterControls: true, withTableMetadata: true });
+    settingsStore.updateEditorSettings({ dataGridToolbarLayout: "split" });
+    await vi.waitFor(() => expect(host.querySelectorAll("[data-grid-condition-editor] > div > .data-grid-topbar-condition-label--compact")).toHaveLength(2));
+    expect(host.querySelector('[data-toolbar-action="refresh"] .data-grid-topbar-action-label--compact')).toBeNull();
+
+    geometry.width = 800;
+    geometry.conditionInputs = { where: 260, order: 230 };
+    resize();
+    await vi.waitFor(() => expect(host.querySelector(".data-grid-topbar-condition-label--compact")).toBeNull());
+  });
+
+  it("remeasures the WHERE/ORDER BY divider without resizing the pane and avoids premature label expansion", async () => {
+    const geometry = { width: 800, filters: 800, actions: 300, conditionInputs: { where: 260, order: 120 } };
+    const resize = mockToolbarGeometry(geometry);
+    const { host, settingsStore } = mountGrid({ filterControls: true, withTableMetadata: true });
+    settingsStore.updateEditorSettings({ dataGridToolbarLayout: "split" });
+    await vi.waitFor(() => expect(host.querySelectorAll("[data-grid-condition-editor] > div > .data-grid-topbar-condition-label--compact")).toHaveLength(2));
+
+    geometry.conditionInputs.order = 165;
+    resize("[data-grid-condition-input-viewport]");
+    await settle();
+    expect(host.querySelectorAll("[data-grid-condition-editor] > div > .data-grid-topbar-condition-label--compact")).toHaveLength(2);
+
+    geometry.conditionInputs.order = 190;
+    resize("[data-grid-condition-input-viewport]");
+    await vi.waitFor(() => expect(host.querySelector(".data-grid-topbar-condition-label--compact")).toBeNull());
+    expect(host.querySelector('[data-toolbar-action="refresh"] .data-grid-topbar-action-label--compact')).toBeNull();
   });
 
   it("does not duplicate the DDL action in the table-data toolbar", async () => {
@@ -308,6 +474,44 @@ describe("DataGrid go-to-column shortcut", () => {
 
     expect(enter.defaultPrevented).toBe(true);
     expect(host.querySelector("[data-column-lookup-panel]")).not.toBeNull();
+  });
+
+  it("requires confirmation before persisting table-data column order", async () => {
+    const { host, grid } = mountGrid({ columns: ["id", "name"], columnLayoutScopeKey: "test-confirm-column-order-save" });
+    await settle();
+
+    grid.value!.moveDisplayableColumn(1, 0);
+    await settle();
+
+    expect(document.body.textContent).toContain(i18n.global.t("grid.confirmColumnOrderTitle"));
+    dialogButton(i18n.global.t("common.save")).click();
+    await settle();
+
+    const root = gridRoot(host);
+    root.focus();
+    goToColumnEvent(root);
+    await settle();
+
+    expect(goToColumnOrder()).toEqual(["name#2", "id#1"]);
+  });
+
+  it("discards a table-data column reorder when confirmation is cancelled", async () => {
+    const { host, grid } = mountGrid({ columns: ["id", "name"], columnLayoutScopeKey: "test-confirm-column-order-cancel" });
+    await settle();
+
+    grid.value!.moveDisplayableColumn(1, 0);
+    await settle();
+
+    expect(document.body.textContent).toContain(i18n.global.t("grid.confirmColumnOrderTitle"));
+    dialogButton(i18n.global.t("common.cancel")).click();
+    await settle();
+
+    const root = gridRoot(host);
+    root.focus();
+    goToColumnEvent(root);
+    await settle();
+
+    expect(goToColumnOrder()).toEqual(["id#1", "name#2"]);
   });
 
   it("does not consume the configured shortcut without a displayable column", async () => {

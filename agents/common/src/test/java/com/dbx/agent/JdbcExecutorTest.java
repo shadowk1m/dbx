@@ -6,6 +6,7 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
+import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
@@ -16,6 +17,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.sql.rowset.serial.SerialBlob;
 
@@ -163,6 +166,76 @@ class JdbcExecutorTest {
     }
 
     @Test
+    void defaultResultValueReturnsJsonSafeTextForNonFiniteFloats() throws Exception {
+        try (Connection connection = DriverManager.getConnection(
+                 "jdbc:h2:mem:nonfinite_default_" + UUID.randomUUID() + ";DB_CLOSE_DELAY=-1");
+             Statement statement = connection.createStatement();
+             ResultSet rs = statement.executeQuery(
+                 "SELECT CAST('NaN' AS DOUBLE), CAST('Infinity' AS REAL), CAST('-Infinity' AS DOUBLE)")) {
+            assertTrue(rs.next());
+            assertEquals("NaN", JdbcExecutor.INSTANCE.defaultResultValue(rs, 1, Types.DOUBLE));
+            assertEquals("+Inf", JdbcExecutor.INSTANCE.defaultResultValue(rs, 2, Types.REAL));
+            assertEquals("-Inf", JdbcExecutor.INSTANCE.defaultResultValue(rs, 3, Types.DOUBLE));
+        }
+    }
+
+    @Test
+    void executeReturnsJsonSafeTextForNonFiniteFloats() throws Exception {
+        try (Connection connection = DriverManager.getConnection(
+                 "jdbc:h2:mem:nonfinite_exec_" + UUID.randomUUID() + ";DB_CLOSE_DELAY=-1")) {
+            QueryResult result = JdbcExecutor.INSTANCE.execute(
+                connection,
+                "SELECT CAST('NaN' AS DOUBLE), CAST('Infinity' AS REAL), CAST('-Infinity' AS DOUBLE)",
+                "",
+                schema -> ""
+            );
+
+            assertEquals(Arrays.asList("NaN", "+Inf", "-Inf"), result.getRows().get(0));
+        }
+    }
+
+    @Test
+    void rowValuesNormalizesNonFiniteFloatsFromCustomReaders() throws Exception {
+        try (Connection connection = DriverManager.getConnection(
+                 "jdbc:h2:mem:nonfinite_reader_" + UUID.randomUUID() + ";DB_CLOSE_DELAY=-1")) {
+            QueryResult result = JdbcExecutor.INSTANCE.execute(
+                connection,
+                "SELECT 1",
+                "",
+                schema -> "",
+                10,
+                null,
+                (rs, index, sqlType) -> Double.NaN
+            );
+
+            assertEquals(Collections.singletonList("NaN"), result.getRows().get(0));
+        }
+    }
+
+    @Test
+    void normalizeResultValueReturnsJsonSafeTextForNonFiniteNumbers() throws Exception {
+        assertEquals("NaN", JdbcExecutor.normalizeResultValue(Double.NaN));
+        assertEquals("+Inf", JdbcExecutor.normalizeResultValue(Float.POSITIVE_INFINITY));
+        assertEquals("-Inf", JdbcExecutor.normalizeResultValue(Double.NEGATIVE_INFINITY));
+        assertEquals(Double.valueOf(1.5), JdbcExecutor.normalizeResultValue(1.5));
+    }
+
+    @Test
+    void abstractAgentResultValueReturnsJsonSafeTextForNonFiniteFloats() throws Exception {
+        ConfiguredJdbcAgent agent = new ConfiguredJdbcAgent(
+            new JdbcAgentProfile("org.h2.Driver", "jdbc:h2:mem:abstract_nonfinite", 0, false, Set.of(), List.of("TABLE"))
+        ) {};
+
+        try (Connection connection = DriverManager.getConnection("jdbc:h2:mem:abstract_nonfinite");
+             Statement statement = connection.createStatement();
+             ResultSet rs = statement.executeQuery("SELECT CAST('NaN' AS DOUBLE), CAST('Infinity' AS REAL)")) {
+            assertTrue(rs.next());
+            assertEquals("NaN", agent.resultValue(rs, 1, Types.DOUBLE));
+            assertEquals("+Inf", agent.resultValue(rs, 2, Types.REAL));
+        }
+    }
+
+    @Test
     void readResultSetCachesColumnTypeMetadataAcrossRows() {
         CountingResultSetFixture fixture = countingResultSet(new Object[][]{
             {1, "Ada"},
@@ -201,6 +274,39 @@ class JdbcExecutorTest {
             result.getExecution_time_ms() >= 25L,
             "row retrieval must count toward execution_time_ms but was " + result.getExecution_time_ms() + "ms"
         );
+    }
+
+    @Test
+    void executeCountsDriverMessageReadingInExecutionTime() {
+        JdbcExecutor.StatementMessageReader reader = statement -> {
+            try {
+                Thread.sleep(30L);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new SQLException(error);
+            }
+            return Collections.singletonList("procedure output");
+        };
+
+        QueryResult result = JdbcExecutor.INSTANCE.execute(
+            executionConnection(false, -1, null, new AtomicInteger(), null, null),
+            "BEGIN OUTPUT_TEXT(); END;", "", schema -> "", () -> "", 100, null, 0,
+            JdbcExecutor.INSTANCE::defaultResultValue, reader
+        );
+
+        assertTrue(result.getExecution_time_ms() >= 25L,
+            "driver message reading must count toward execution_time_ms but was " + result.getExecution_time_ms() + "ms");
+        for (boolean bounded : List.of(false, true)) {
+            Connection connection = executionConnection(false, -1, null, new AtomicInteger(), null, null);
+            QueryPageResult page = bounded
+                ? JdbcExecutor.INSTANCE.executeBoundedPage(connection, "BEGIN OUTPUT_TEXT(); END;", "",
+                    schema -> "", () -> "", new QueryPageOptions(), JdbcExecutor.INSTANCE::defaultResultValue, reader)
+                : JdbcExecutor.INSTANCE.executePage(connection, "BEGIN OUTPUT_TEXT(); END;", "",
+                    schema -> "", () -> "", new QueryPageOptions(), JdbcExecutor.INSTANCE::defaultResultValue, reader, false);
+            assertEquals(List.of(List.of("procedure output")), page.getRows());
+            assertTrue(page.getExecution_time_ms() >= 25L,
+                "paged message reading must count toward execution_time_ms but was " + page.getExecution_time_ms() + "ms");
+        }
     }
 
     @Test
@@ -334,6 +440,42 @@ class JdbcExecutorTest {
         assertEquals(Arrays.asList("id", "name"), result.getColumns());
         assertEquals(Arrays.asList(Arrays.asList(1, "Ada")), result.getRows());
         assertEquals("informational", result.getMessages().get(0).get("message"));
+    }
+
+    @Test
+    void executeRetainsRowsAndAddsDriverMessagesWhenResultSetCompletes() {
+        CountingResultSetFixture fixture = countingResultSet(new Object[][]{{1, "Ada"}});
+        boolean[] closed = {false};
+        JdbcExecutor.StatementMessageReader reader = new JdbcExecutor.StatementMessageReader() {
+            @Override
+            public List<String> read(Statement statement) {
+                return Collections.emptyList();
+            }
+
+            @Override
+            public List<String> close(Statement statement) {
+                closed[0] = true;
+                return Arrays.asList("procedure output");
+            }
+        };
+
+        QueryResult result = JdbcExecutor.INSTANCE.execute(
+            executionConnection(true, -1, null, new AtomicInteger(), fixture.resultSet(), null),
+            "BEGIN OPEN_RESULT(); END;",
+            "",
+            schema -> "",
+            () -> "",
+            100,
+            null,
+            0,
+            JdbcExecutor.INSTANCE::defaultResultValue,
+            reader
+        );
+
+        assertTrue(closed[0]);
+        assertEquals(Arrays.asList("id", "name"), result.getColumns());
+        assertEquals(Arrays.asList(Arrays.asList(1, "Ada")), result.getRows());
+        assertEquals("procedure output", result.getMessages().get(0).get("message"));
     }
 
     @Test

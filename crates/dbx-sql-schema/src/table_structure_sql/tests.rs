@@ -1,6 +1,134 @@
 use super::*;
 use crate::models::connection::DatabaseType;
+use crate::table_structure_sql::dialect::StructureDialect;
 use crate::types::PgPartitionKind;
+
+fn foreign_create_options(server: &str) -> CreateTableDialectOptions {
+    CreateTableDialectOptions {
+        postgres_foreign_table: Some(PostgresForeignTableCreateOptions {
+            server: server.into(),
+            options: vec![
+                PostgresForeignTableOption { name: "schema_name".into(), value: "remote's schema".into() },
+                PostgresForeignTableOption { name: "table_name".into(), value: "source table".into() },
+            ],
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn postgres_foreign_table_create_quotes_server_options_and_comments() {
+    let mut options = structure_change_options(
+        DatabaseType::Postgres,
+        Some("local\"schema"),
+        "foreign table",
+        vec![column("remote\"column")],
+    );
+    options.table_comment = Some("foreign's comment".into());
+    options.columns[0].comment = "column's comment".into();
+    options.columns[0].is_nullable = false;
+    options.columns[0].default_value = "'fallback'".into();
+    let result = build_create_table_sql_with_dialect_options(options, None, foreign_create_options("server\"name"));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements.len(), 3);
+    assert!(result.statements[0].starts_with("CREATE FOREIGN TABLE \"local\"\"schema\".\"foreign table\" ("));
+    assert!(result.statements[0].contains("\"remote\"\"column\""));
+    assert!(result.statements[0].contains("NOT NULL"));
+    assert!(result.statements[0].contains("DEFAULT 'fallback'"));
+    assert!(result.statements[0].ends_with(
+        "SERVER \"server\"\"name\" OPTIONS (\"schema_name\" 'remote''s schema', \"table_name\" 'source table');"
+    ));
+    assert_eq!(
+        result.statements[1],
+        "COMMENT ON FOREIGN TABLE \"local\"\"schema\".\"foreign table\" IS 'foreign''s comment';"
+    );
+    assert!(result.statements[2].contains("COMMENT ON COLUMN"));
+}
+
+#[test]
+fn postgres_foreign_table_create_validates_required_server_and_options() {
+    let options = structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    for server in ["", " ", "invalid\0server"] {
+        let result = build_create_table_sql_with_dialect_options(options.clone(), None, foreign_create_options(server));
+        assert!(result.statements.is_empty());
+        assert!(!result.warnings.is_empty());
+    }
+    for option in [
+        PostgresForeignTableOption { name: "schema_name".into(), value: "duplicate".into() },
+        PostgresForeignTableOption { name: "".into(), value: "orphan".into() },
+        PostgresForeignTableOption { name: "bad\0name".into(), value: "value".into() },
+        PostgresForeignTableOption { name: "filename".into(), value: "bad\0value".into() },
+    ] {
+        let mut settings = foreign_create_options("server");
+        settings.postgres_foreign_table.as_mut().unwrap().options.push(option);
+        let result = build_create_table_sql_with_dialect_options(options.clone(), None, settings);
+        assert!(result.statements.is_empty());
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn postgres_foreign_table_create_rejects_unsupported_dialects_and_constraints() {
+    let options = structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    for database_type in [DatabaseType::Mysql, DatabaseType::Sqlite, DatabaseType::OpenGauss, DatabaseType::Gaussdb] {
+        let mut request = options.clone();
+        request.database_type = Some(database_type);
+        assert!(build_create_table_sql_with_dialect_options(request, None, foreign_create_options("server"))
+            .statements
+            .is_empty());
+    }
+    let mut primary = options.clone();
+    primary.columns[0].is_primary_key = true;
+    let mut identity = options.clone();
+    identity.columns[0].extra =
+        Some(serde_json::from_value(serde_json::json!({"identity":{"generation":"ALWAYS"}})).unwrap());
+    let mut partition = options.clone();
+    partition.partitioned = true;
+    let mut redshift = options;
+    redshift.driver_profile = Some("redshift".into());
+    for request in [primary, identity, partition, redshift] {
+        let result = build_create_table_sql_with_dialect_options(request, None, foreign_create_options("server"));
+        assert!(result.statements.is_empty());
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn postgres_foreign_table_options_are_optional_and_allow_empty_values() {
+    let mut options =
+        structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    options.foreign_table = true;
+    options.table_comment = Some("table comment".into());
+    let regular =
+        build_create_table_sql_with_dialect_options(options.clone(), None, CreateTableDialectOptions::default());
+    assert!(regular.statements[0].starts_with("CREATE TABLE "));
+    assert!(regular.statements[1].starts_with("COMMENT ON TABLE "));
+    let mut settings = foreign_create_options("server");
+    settings.postgres_foreign_table.as_mut().unwrap().options.clear();
+    let result = build_create_table_sql_with_dialect_options(options.clone(), None, settings.clone());
+    assert!(result.warnings.is_empty());
+    assert!(result.statements[0].ends_with("SERVER \"server\";"));
+    settings
+        .postgres_foreign_table
+        .as_mut()
+        .unwrap()
+        .options
+        .push(PostgresForeignTableOption { name: "custom_option".into(), value: "".into() });
+    let result = build_create_table_sql_with_dialect_options(options, None, settings);
+    assert!(result.warnings.is_empty());
+    assert!(result.statements[0].ends_with("OPTIONS (\"custom_option\" '');"));
+}
+
+#[test]
+fn postgres_foreign_table_create_allows_serial_types() {
+    let mut options =
+        structure_change_options(DatabaseType::Postgres, Some("public"), "foreign_table", vec![column("id")]);
+    options.columns[0].data_type = "serial".into();
+    let result = build_create_table_sql_with_dialect_options(options, None, foreign_create_options("server"));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert!(result.statements[0].starts_with("CREATE FOREIGN TABLE"));
+    assert!(result.statements[0].to_ascii_lowercase().contains("serial"));
+}
 
 fn column(name: &str) -> EditableStructureColumn {
     EditableStructureColumn {
@@ -69,7 +197,207 @@ fn structure_change_options(
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     }
+}
+
+#[test]
+fn oceanbase_existing_primary_key_ordered_change_payload() {
+    let options = structure_change_options(
+        DatabaseType::OceanbaseOracle,
+        Some("APP"),
+        "SOURCE",
+        vec![existing_pk_column("ID", "NUMBER", true, true), existing_pk_column("V", "NUMBER", true, true)],
+    );
+    let mut payload = serde_json::to_value(options).unwrap();
+    payload["primaryKeyChange"] = serde_json::json!({
+        "name": "PK_SOURCE",
+        "originalColumns": ["ID", "V"],
+        "columns": ["V", "ID"]
+    });
+    let result = build_table_structure_change_sql(serde_json::from_value(payload).unwrap());
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(
+        result.statements,
+        vec![
+            "ALTER TABLE \"APP\".\"SOURCE\" DROP CONSTRAINT \"PK_SOURCE\";",
+            "ALTER TABLE \"APP\".\"SOURCE\" ADD CONSTRAINT \"PK_SOURCE\" PRIMARY KEY (\"V\", \"ID\");",
+        ]
+    );
+}
+
+#[test]
+fn oceanbase_existing_primary_key_delete_payload() {
+    let options = structure_change_options(
+        DatabaseType::OceanbaseOracle,
+        Some("APP"),
+        "SOURCE",
+        vec![existing_pk_column("ID", "NUMBER", true, true)],
+    );
+    let mut payload = serde_json::to_value(options).unwrap();
+    payload["primaryKeyChange"] = serde_json::json!({
+        "name": "PK_SOURCE",
+        "originalColumns": ["ID"],
+        "columns": []
+    });
+    let result = build_table_structure_change_sql(serde_json::from_value(payload).unwrap());
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec!["ALTER TABLE \"APP\".\"SOURCE\" DROP CONSTRAINT \"PK_SOURCE\";"]);
+}
+
+#[test]
+fn oracle_existing_primary_key_explicit_index_policy() {
+    let options = structure_change_options(
+        DatabaseType::Oracle,
+        Some("APP"),
+        "SOURCE",
+        vec![existing_pk_column("ID", "NUMBER", true, true), existing_pk_column("V", "NUMBER", true, true)],
+    );
+    for (policy, columns, new_name, expected_add) in [
+        ("keep", vec!["V", "ID"], None, Some("ALTER TABLE \"APP\".\"SOURCE\" ADD CONSTRAINT \"PK_SOURCE\" PRIMARY KEY (\"V\", \"ID\") USING INDEX \"APP\".\"ORIGINAL_IDX\";")),
+        ("keep", vec!["V"], Some("SOURCE_V_IDX"), Some("ALTER TABLE \"APP\".\"SOURCE\" ADD CONSTRAINT \"PK_SOURCE\" PRIMARY KEY (\"V\") USING INDEX (CREATE UNIQUE INDEX \"APP\".\"SOURCE_V_IDX\" ON \"APP\".\"SOURCE\" (\"V\"));")),
+        ("drop", vec!["V", "ID"], Some("SOURCE_V_ID_IDX"), Some("ALTER TABLE \"APP\".\"SOURCE\" ADD CONSTRAINT \"PK_SOURCE\" PRIMARY KEY (\"V\", \"ID\") USING INDEX (CREATE UNIQUE INDEX \"APP\".\"SOURCE_V_ID_IDX\" ON \"APP\".\"SOURCE\" (\"V\", \"ID\"));")),
+        ("keep", vec![], None, None),
+        ("drop", vec![], None, None),
+    ] {
+        let mut payload = serde_json::to_value(&options).unwrap();
+        payload["primaryKeyChange"] = serde_json::json!({
+            "name": "PK_SOURCE", "originalColumns": ["ID", "V"], "columns": columns,
+            "oracleIndex": { "policy": policy, "owner": "APP", "name": "ORIGINAL_IDX", "newName": new_name }
+        });
+        let result = build_table_structure_change_sql(serde_json::from_value(payload).unwrap());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let mut expected = vec![format!("ALTER TABLE \"APP\".\"SOURCE\" DROP CONSTRAINT \"PK_SOURCE\" {} INDEX;", policy.to_uppercase())];
+        if let Some(add) = expected_add { expected.push(add.to_string()); }
+        assert_eq!(result.statements, expected);
+    }
+}
+
+#[test]
+fn oracle_existing_primary_key_rejects_unverified_index_plan() {
+    let options = structure_change_options(
+        DatabaseType::Oracle,
+        Some("APP"),
+        "SOURCE",
+        vec![existing_pk_column("ID", "NUMBER", true, true), existing_pk_column("V", "NUMBER", false, false)],
+    );
+    let mut payload = serde_json::to_value(options).unwrap();
+    payload["primaryKeyChange"] = serde_json::json!({
+        "name": "PK_SOURCE", "originalColumns": ["ID"], "columns": ["V"],
+        "oracleIndex": {"policy": "keep", "owner": "APP", "name": "PK_SOURCE", "newName": "SOURCE_V_IDX"}
+    });
+    for (pointer, value) in [
+        ("/primaryKeyChange/oracleIndex", serde_json::Value::Null),
+        ("/primaryKeyChange/oracleIndex/policy", serde_json::json!("cascade")),
+        ("/primaryKeyChange/oracleIndex/owner", serde_json::json!("OTHER")),
+        ("/primaryKeyChange/oracleIndex/name", serde_json::json!("")),
+        ("/primaryKeyChange/oracleIndex/newName", serde_json::Value::Null),
+        ("/primaryKeyChange/oracleIndex/newName", serde_json::json!("PK_SOURCE")),
+        ("/primaryKeyChange/oracleIndex/newName", serde_json::json!("INVALID; DROP TABLE X")),
+        ("/databaseType", serde_json::json!("oceanbase-oracle")),
+    ] {
+        let mut invalid = payload.clone();
+        *invalid.pointer_mut(pointer).unwrap() = value;
+        let result = build_table_structure_change_sql(serde_json::from_value(invalid).unwrap());
+        assert!(result.statements.is_empty(), "{pointer}: {:?}", result.statements);
+        assert!(!result.warnings.is_empty(), "{pointer}");
+    }
+}
+
+#[test]
+fn oracle_existing_primary_key_preserves_disabled_state_without_index() {
+    let options = structure_change_options(
+        DatabaseType::Oracle,
+        Some("APP"),
+        "SOURCE",
+        vec![existing_pk_column("ID", "NUMBER", true, true), existing_pk_column("V", "NUMBER", true, true)],
+    );
+    let mut payload = serde_json::to_value(options).unwrap();
+    payload["primaryKeyChange"] = serde_json::json!({
+        "name":"PK_SOURCE", "originalColumns":["ID","V"], "columns":["V","ID"],
+        "oracleIndex":{"policy":"none","owner":"APP","name":""},
+        "oracleState":{"enabled":false,"validated":false,"deferrable":false,"initiallyDeferred":false,"rely":true}
+    });
+    let result = build_table_structure_change_sql(serde_json::from_value(payload).unwrap());
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec![
+        "ALTER TABLE \"APP\".\"SOURCE\" DROP CONSTRAINT \"PK_SOURCE\";",
+        "ALTER TABLE \"APP\".\"SOURCE\" ADD CONSTRAINT \"PK_SOURCE\" PRIMARY KEY (\"V\", \"ID\") NOT DEFERRABLE INITIALLY IMMEDIATE RELY DISABLE NOVALIDATE;",
+    ]);
+}
+
+#[test]
+fn oracle_existing_primary_key_preserves_deferred_state_with_nonunique_index() {
+    let options = structure_change_options(
+        DatabaseType::Oracle,
+        Some("APP"),
+        "SOURCE",
+        vec![existing_pk_column("ID", "NUMBER", true, true), existing_pk_column("V", "NUMBER", true, true)],
+    );
+    let mut payload = serde_json::to_value(options).unwrap();
+    payload["primaryKeyChange"] = serde_json::json!({
+        "name":"PK_SOURCE", "originalColumns":["ID","V"], "columns":["V","ID"],
+        "oracleIndex":{"policy":"drop","owner":"APP","name":"OLD_INDEX","newName":"NEW_INDEX"},
+        "oracleState":{"enabled":true,"validated":true,"deferrable":true,"initiallyDeferred":true,"rely":false}
+    });
+    let result = build_table_structure_change_sql(serde_json::from_value(payload).unwrap());
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec![
+        "ALTER TABLE \"APP\".\"SOURCE\" DROP CONSTRAINT \"PK_SOURCE\" DROP INDEX;",
+        "ALTER TABLE \"APP\".\"SOURCE\" ADD CONSTRAINT \"PK_SOURCE\" PRIMARY KEY (\"V\", \"ID\") DEFERRABLE INITIALLY DEFERRED NORELY USING INDEX (CREATE INDEX \"APP\".\"NEW_INDEX\" ON \"APP\".\"SOURCE\" (\"V\", \"ID\")) ENABLE VALIDATE;",
+    ]);
+}
+
+#[test]
+fn oceanbase_existing_primary_key_rejects_invalid_or_combined_drafts() {
+    let options = structure_change_options(
+        DatabaseType::OceanbaseOracle,
+        Some("APP"),
+        "SOURCE",
+        vec![existing_pk_column("ID", "NUMBER", true, true), existing_pk_column("V", "NUMBER", false, false)],
+    );
+    let mut payload = serde_json::to_value(options).unwrap();
+    payload["primaryKeyChange"] =
+        serde_json::json!({ "name": "PK_SOURCE", "originalColumns": ["ID"], "columns": ["V"] });
+    for (pointer, value) in [
+        ("/databaseType", serde_json::json!("oracle")),
+        ("/databaseType", serde_json::json!("saphana")),
+        ("/databaseType", serde_json::json!("mysql")),
+        ("/primaryKeyChange/name", serde_json::json!("")),
+        ("/primaryKeyChange/columns", serde_json::json!(["V", "V"])),
+        ("/primaryKeyChange/columns", serde_json::json!(["UNKNOWN"])),
+        ("/primaryKeyChange/originalColumns", serde_json::json!(["V"])),
+        ("/columns/0/comment", serde_json::json!("changed comment")),
+        ("/columns/1/markedForDrop", serde_json::json!(true)),
+    ] {
+        let mut invalid = payload.clone();
+        *invalid.pointer_mut(pointer).unwrap() = value;
+        let result = build_table_structure_change_sql(serde_json::from_value(invalid).unwrap());
+        assert!(result.statements.is_empty(), "{pointer}: {:?}", result.statements);
+        assert!(!result.warnings.is_empty(), "{pointer}");
+    }
+}
+
+#[test]
+fn oceanbase_existing_primary_key_unchanged_order_is_a_noop() {
+    let mut options = structure_change_options(
+        DatabaseType::OceanbaseOracle,
+        Some("APP"),
+        "SOURCE",
+        vec![existing_pk_column("ID", "NUMBER", true, true)],
+    );
+    options.primary_key_change = Some(ExistingPrimaryKeyChange {
+        name: "PK_SOURCE".to_string(),
+        original_columns: vec!["ID".to_string()],
+        columns: vec!["ID".to_string()],
+        oracle_index: None,
+        oracle_state: None,
+    });
+    let result = build_table_structure_change_sql(options);
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.is_empty());
 }
 
 #[test]
@@ -401,6 +729,7 @@ fn index(name: &str, columns: &[&str]) -> EditableStructureIndex {
         comment: String::new(),
         concurrently: false,
         original: None,
+        oracle_original_missing: false,
         marked_for_drop: false,
     }
 }
@@ -418,6 +747,9 @@ fn existing_index(name: &str, columns: &[&str], is_unique: bool) -> EditableStru
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![],
         constraint_backed: false,
     });
@@ -464,6 +796,9 @@ fn index_change_options(
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     }
 }
 
@@ -486,6 +821,7 @@ fn trigger(name: &str, timing: &str, event: &str, statement: &str) -> EditableSt
     EditableStructureTrigger {
         id: name.to_string(),
         name: name.to_string(),
+        oracle_exact: None,
         timing: timing.to_string(),
         event: event.to_string(),
         statement: statement.to_string(),
@@ -526,6 +862,9 @@ fn builds_mysql_column_and_index_changes() {
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![],
         constraint_backed: false,
     });
@@ -551,6 +890,9 @@ fn builds_mysql_column_and_index_changes() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -563,6 +905,141 @@ fn builds_mysql_column_and_index_changes() {
             "CREATE UNIQUE INDEX `uniq_users_email` ON `users` (`email`);",
         ]
     );
+}
+
+#[test]
+fn mysql_rebuild_index_uses_one_alter_table() {
+    let mut changed = existing_index("userId", &["userId", "cylId", "isClose"], false);
+    changed.columns.push("isEmpty".to_string());
+    changed.index_type = "BTREE".to_string();
+    changed.original.as_mut().unwrap().index_type = Some("BTREE".to_string());
+    let mut options = index_change_options(DatabaseType::Mysql, Some("dbx12441_native"), changed);
+    options.table_name = "ls_station_delivery_staff_stock_log".to_string();
+
+    let result = build_table_structure_change_sql(options);
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec![
+        "ALTER TABLE `ls_station_delivery_staff_stock_log` DROP INDEX `userId`, ADD INDEX `userId` USING BTREE (`userId`, `cylId`, `isClose`, `isEmpty`);"
+    ]);
+}
+
+#[test]
+fn mysql_rebuild_index_preserves_definition_types() {
+    for (index_type, unique, definition) in [
+        ("", false, "INDEX `idx`"),
+        ("btree", false, "INDEX `idx` USING BTREE"),
+        ("HASH", false, "INDEX `idx` USING HASH"),
+        ("BTREE", true, "UNIQUE INDEX `idx` USING BTREE"),
+        ("", true, "UNIQUE INDEX `idx`"),
+        ("FULLTEXT", false, "FULLTEXT INDEX `idx`"),
+        ("SPATIAL", false, "SPATIAL INDEX `idx`"),
+        ("RTREE", false, "SPATIAL INDEX `idx`"),
+    ] {
+        let mut changed = existing_index("idx", &["old_key"], false);
+        changed.columns = vec!["second".to_string(), "first".to_string()];
+        changed.index_type = index_type.to_string();
+        changed.is_unique = unique;
+        changed.comment = "owner's index".to_string();
+        let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, changed));
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(
+            result.statements,
+            vec![format!(
+                "ALTER TABLE `USERS` DROP INDEX `idx`, ADD {definition} (`second`, `first`) COMMENT 'owner''s index';"
+            )]
+        );
+    }
+}
+
+#[test]
+fn mysql_rebuild_index_preserves_quoted_names_and_functional_keys() {
+    let expression = "((lower(`email`)))";
+    let mut changed = existing_index("old`idx", &["email"], false);
+    changed.name = "new`idx".to_string();
+    // Parenthesized plain identifiers keep their existing quoting behavior;
+    // only wrapped functional key parts are treated as SQL expressions.
+    changed.columns = vec!["a`b".to_string(), "name(10)".to_string(), expression.to_string()];
+    let mut options = index_change_options(DatabaseType::Mysql, Some("db`name"), changed);
+    options.table_name = "table`name".to_string();
+    let result = build_table_structure_change_sql(options);
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(
+        result.statements,
+        vec![format!(
+            "ALTER TABLE `table``name` DROP INDEX `old``idx`, ADD INDEX `new``idx` (`a``b`, `name(10)`, {expression});"
+        )]
+    );
+}
+
+#[test]
+fn mysql_rebuild_index_rejects_empty_replacement_without_drop() {
+    for (name, columns) in [(" ", vec!["email"]), ("idx", vec![]), ("idx", vec![" ", ""])] {
+        let mut changed = existing_index("idx", &["email"], false);
+        changed.name = name.to_string();
+        changed.columns = columns.into_iter().map(str::to_string).collect();
+        let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, changed));
+
+        assert!(result.statements.is_empty(), "{:?}", result.statements);
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn mysql_rebuild_index_keeps_noop_primary_and_capability_guards() {
+    let unchanged = existing_index("idx", &["email"], false);
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, unchanged));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.is_empty());
+
+    let mut primary = existing_primary_index("PRIMARY", &["id"]);
+    primary.columns.push("email".to_string());
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, primary));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.iter().any(|warning| warning.contains("cannot be edited")));
+
+    let mut changed = existing_index("idx", &["email"], false);
+    changed.columns.push("id".to_string());
+    let mut options = index_change_options(DatabaseType::Mysql, None, changed);
+    options.driver_profile = Some("starrocks".to_string());
+    let mut warnings = Vec::new();
+    assert!(super::indexes::build_index_sql(&options, &mut warnings).is_empty());
+    assert!(warnings.iter().any(|warning| warning.contains("Editing existing indexes is not supported")));
+    let result = build_table_structure_change_sql(options);
+    assert!(result.statements.is_empty());
+    assert!(!result.warnings.is_empty());
+}
+
+#[test]
+fn mysql_rebuild_index_ignores_stale_concurrently_flag_with_real_change() {
+    let mut changed = existing_index("idx", &["email"], false);
+    changed.concurrently = true;
+    changed.comment = "new comment".to_string();
+    let result = build_table_structure_change_sql(index_change_options(DatabaseType::Mysql, None, changed));
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE `USERS` DROP INDEX `idx`, ADD INDEX `idx` (`email`) COMMENT 'new comment';"]
+    );
+}
+
+#[test]
+fn mysql_dialect_other_engines_keep_standalone_rebuilds() {
+    for database_type in [DatabaseType::Goldendb, DatabaseType::Sundb, DatabaseType::Databend] {
+        let mut changed = existing_index("idx", &["email"], false);
+        changed.is_unique = true;
+        let result = build_table_structure_change_sql(index_change_options(database_type, None, changed));
+
+        assert!(result.warnings.is_empty(), "{database_type:?}: {:?}", result.warnings);
+        assert_eq!(
+            result.statements,
+            vec!["DROP INDEX `idx` ON `USERS`;", "CREATE UNIQUE INDEX `idx` ON `USERS` (`email`);",],
+            "{database_type:?}"
+        );
+    }
 }
 
 #[test]
@@ -835,7 +1312,6 @@ fn dameng_new_and_dropped_indexes_do_not_use_or_replace() {
 #[test]
 fn non_dameng_index_rebuilds_do_not_use_or_replace() {
     for database_type in [
-        DatabaseType::Mysql,
         DatabaseType::Postgres,
         DatabaseType::Sqlite,
         DatabaseType::SqlServer,
@@ -847,6 +1323,13 @@ fn non_dameng_index_rebuilds_do_not_use_or_replace() {
     ] {
         let mut changed = existing_index("IDX_USERS_EMAIL", &["EMAIL"], false);
         changed.is_unique = true;
+        if database_type == DatabaseType::Oracle {
+            let original = changed.original.as_mut().unwrap();
+            original.key_is_expression = vec![false];
+            original.key_directions = vec!["ASC".to_string()];
+            original.visibility = Some("VISIBLE".to_string());
+            original.key_metadata_complete = true;
+        }
         let result = build_table_structure_change_sql(index_change_options(database_type, None, changed));
 
         assert_eq!(result.warnings, Vec::<String>::new(), "database type: {database_type:?}");
@@ -917,6 +1400,9 @@ fn builds_xugu_type_change_with_native_syntax() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -946,6 +1432,20 @@ fn builds_xugu_type_change_with_native_syntax() {
         postgres_result.statements,
         vec!["ALTER TABLE \"public\".\"info_x\" ALTER COLUMN \"code\" TYPE integer USING \"code\"::integer;"]
     );
+}
+
+#[test]
+fn oracle_dialect_indexes_without_oracle_family_metadata_keep_existing_rebuild_behavior() {
+    for database_type in [DatabaseType::Iris, DatabaseType::Yashandb, DatabaseType::Xugu] {
+        let mut changed = existing_index("IDX_USERS_EMAIL", &["EMAIL"], false);
+        changed.is_unique = true;
+        let result = build_table_structure_change_sql(index_change_options(database_type, None, changed));
+
+        assert_eq!(result.warnings, Vec::<String>::new(), "{database_type:?}: {result:?}");
+        assert_eq!(result.statements.len(), 2, "{database_type:?}: {result:?}");
+        assert!(result.statements[0].starts_with("DROP INDEX "), "{database_type:?}: {result:?}");
+        assert!(result.statements[1].starts_with("CREATE UNIQUE INDEX "), "{database_type:?}: {result:?}");
+    }
 }
 
 #[test]
@@ -1187,6 +1687,9 @@ fn builds_mysql_unsigned_integer_column_with_length_before_attribute() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1228,6 +1731,9 @@ fn doris_table_editor_renames_column_without_mysql_change_syntax() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1294,6 +1800,9 @@ fn dameng_integer_column_omits_mysql_display_width() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1342,6 +1851,9 @@ fn builds_highgo_foreign_key_changes_with_postgres_syntax() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1396,6 +1908,9 @@ fn builds_informix_column_and_index_changes() {
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![],
         constraint_backed: false,
     });
@@ -1421,6 +1936,9 @@ fn builds_informix_column_and_index_changes() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1483,6 +2001,9 @@ fn oracle_does_not_generate_drop_sql_for_all_columns() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.statements, Vec::<String>::new());
@@ -1561,6 +2082,9 @@ fn oracle_create_table_places_default_before_not_null() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1633,6 +2157,9 @@ fn oracle_create_table_preserves_character_length_units() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert!(result.statements[0].contains("BYTE_COL VARCHAR2(12 BYTE)"));
@@ -1674,6 +2201,9 @@ fn oracle_create_table_uses_unquoted_identifiers_for_new_objects() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1716,6 +2246,9 @@ fn oracle_create_table_leaves_uppercase_regular_identifier_unquoted() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1757,6 +2290,9 @@ fn oracle_create_table_quotes_special_and_reserved_identifiers() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1801,6 +2337,9 @@ fn oracle_create_table_distinguishes_new_and_referenced_foreign_key_identifiers(
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1846,6 +2385,9 @@ fn oracle_create_table_extracts_single_line_trigger_source_into_the_body() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1883,6 +2425,9 @@ fn oracle_create_table_warns_instead_of_emitting_an_unparsed_trigger_declaration
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.statements, vec!["CREATE TABLE \"APP\".dbx_copy (\n  \"id\" NUMBER\n);"]);
@@ -1924,6 +2469,9 @@ fn oracle_existing_quoted_identifiers_keep_exact_spelling() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -1962,6 +2510,9 @@ fn oracle_new_identifier_formatting_does_not_change_other_dialects() {
             is_gaussdb_m_mode: false,
             table_collation: None,
             primary_key_name: None,
+            primary_key_change: None,
+            oracle_constraint_changes: None,
+            oracle_foreign_key_changes: None,
         });
 
         assert_eq!(result.warnings, Vec::<String>::new(), "{database_type:?}");
@@ -2039,6 +2590,9 @@ fn iris_drop_index_includes_table_name() {
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![],
         constraint_backed: false,
     });
@@ -2062,6 +2616,9 @@ fn iris_drop_index_includes_table_name() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2109,6 +2666,9 @@ fn iris_ignores_comment_changes_but_keeps_supported_column_alters() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(
@@ -2197,6 +2757,9 @@ fn oracle_compatible_databases_keep_comment_on_sql() {
             is_gaussdb_m_mode: false,
             table_collation: None,
             primary_key_name: None,
+            primary_key_change: None,
+            oracle_constraint_changes: None,
+            oracle_foreign_key_changes: None,
         });
 
         assert_eq!(result.warnings, Vec::<String>::new(), "{database_type:?}");
@@ -2237,6 +2800,9 @@ fn mysql_create_index_with_comment() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2276,6 +2842,9 @@ fn manticoresearch_builds_create_table_sql_only() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2325,6 +2894,9 @@ fn manticoresearch_builds_add_and_drop_column_sql() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2376,6 +2948,9 @@ fn gbase8a_uses_limited_mysql_ddl() {
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![],
         constraint_backed: false,
     });
@@ -2399,6 +2974,9 @@ fn gbase8a_uses_limited_mysql_ddl() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(
@@ -2475,6 +3053,9 @@ fn gbase8a_allows_mysql_style_column_reorder() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2491,8 +3072,8 @@ fn gbase8a_allows_mysql_style_column_reorder() {
 #[test]
 fn gbase8s_uses_informix_ddl_not_mysql() {
     let result = build_create_table_sql(TableStructureSqlOptions {
-        database_type: Some(DatabaseType::Gbase),
-        driver_profile: Some("gbase8s".to_string()),
+        database_type: Some(DatabaseType::Gbase8s),
+        driver_profile: None,
         schema: Some("gbasedbt".to_string()),
         table_name: "issue8003_repro".to_string(),
         columns: vec![
@@ -2522,6 +3103,9 @@ fn gbase8s_uses_informix_ddl_not_mysql() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2561,6 +3145,9 @@ fn gbase_without_driver_profile_still_uses_mysql_ddl() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2602,6 +3189,9 @@ fn manticoresearch_does_not_drop_id_column() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.statements, Vec::<String>::new());
@@ -2676,6 +3266,9 @@ fn manticoresearch_warns_when_existing_column_properties_change() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.statements, Vec::<String>::new());
@@ -2717,6 +3310,9 @@ fn manticoresearch_ignores_mysql_column_options() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2761,6 +3357,9 @@ fn manticoresearch_builds_text_column_properties() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2797,6 +3396,9 @@ fn manticoresearch_builds_json_secondary_index_property() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2829,6 +3431,9 @@ fn mysql_create_unique_index_with_comment_and_btree() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2863,6 +3468,9 @@ fn mysql_create_functional_index_preserves_key_part_syntax() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2897,6 +3505,9 @@ fn mysql_add_timestamp_column_drops_invalid_precision() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2931,6 +3542,9 @@ fn mysql_add_timestamp_column_preserves_valid_precision() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -2972,6 +3586,9 @@ fn builds_postgres_create_table_with_comments_and_index() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3010,6 +3627,9 @@ fn quotes_expression_like_new_index_columns_without_provenance() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3088,6 +3708,9 @@ fn create_table_trims_table_name_whitespace_for_all_statements() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3131,6 +3754,9 @@ fn warns_for_sqlite_unsafe_column_changes() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.statements, Vec::<String>::new());
@@ -3156,6 +3782,9 @@ fn qualifies_attached_sqlite_table_and_index_changes() {
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![],
         constraint_backed: false,
     });
@@ -3180,6 +3809,9 @@ fn qualifies_attached_sqlite_table_and_index_changes() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3255,6 +3887,9 @@ fn builds_rqlite_changes_with_sqlite_dialect() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3291,6 +3926,9 @@ fn builds_kingbase_add_column_without_column_keyword() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3362,6 +4000,9 @@ fn builds_mysql_column_reorder_statements() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3424,6 +4065,9 @@ fn mysql_add_column_before_existing_column_does_not_reorder_shifted_column() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3493,6 +4137,9 @@ fn mysql_existing_column_reorder_does_not_reorder_columns_shifted_by_prior_move(
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3574,6 +4221,9 @@ fn mysql_moving_first_column_to_end_uses_single_reorder_statement() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3605,6 +4255,9 @@ fn builds_sql_server_quoted_column_and_index_statements() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3642,6 +4295,9 @@ fn sqlserver_strips_mysql_display_width_from_fixed_integer_types() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3673,6 +4329,9 @@ fn sqlserver_strips_scale_from_float() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3704,6 +4363,9 @@ fn sqlserver_preserves_float_mantissa_bits() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3760,6 +4422,9 @@ fn sqlserver_default_changes_drop_old_constraints_with_isolated_batches() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -3983,6 +4648,9 @@ fn sqlserver_unchanged_foreign_key_does_not_warn_when_saving_other_changes() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -4019,6 +4687,9 @@ fn sqlserver_add_column_with_identity() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -4056,6 +4727,9 @@ fn sqlserver_legacy_column_comment_change_uses_legacy_extended_properties() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -4096,6 +4770,9 @@ fn dameng_add_column_with_identity() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -4126,6 +4803,9 @@ fn dameng_uppercases_lowercase_column_type() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -4163,6 +4843,9 @@ fn dameng_rejects_identity_on_incompatible_type() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.statements, Vec::<String>::new());
@@ -4202,6 +4885,9 @@ fn sqlserver_rejects_identity_on_incompatible_type() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.statements, Vec::<String>::new());
@@ -4212,9 +4898,11 @@ fn sqlserver_rejects_identity_on_incompatible_type() {
 }
 
 #[test]
-fn sqlserver_changed_foreign_key_still_warns_as_unsupported() {
+fn sqlserver_foreign_key_edits_generate_alter_statements() {
     let mut user_fk = foreign_key("fk_orders_user_id", "user_id", "accounts", "id");
     user_fk.ref_schema = "dbo".to_string();
+    user_fk.on_delete = "CASCADE".to_string();
+    user_fk.on_update = "RESTRICT".to_string();
     user_fk.original = Some(ForeignKeyInfo {
         name: "fk_orders_user_id".to_string(),
         column: "user_id".to_string(),
@@ -4244,10 +4932,19 @@ fn sqlserver_changed_foreign_key_still_warns_as_unsupported() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
-    assert_eq!(result.statements, Vec::<String>::new());
-    assert_eq!(result.warnings, vec!["Editing foreign keys is not supported for sqlserver from this editor."]);
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec![
+            "ALTER TABLE [dbo].[orders] DROP CONSTRAINT [fk_orders_user_id];",
+            "ALTER TABLE [dbo].[orders] ADD CONSTRAINT [fk_orders_user_id] FOREIGN KEY ([user_id]) REFERENCES [dbo].[accounts] ([id]) ON DELETE CASCADE ON UPDATE NO ACTION;"
+        ]
+    );
 }
 
 #[test]
@@ -4291,6 +4988,9 @@ fn sqlserver_unchanged_identity_extra_does_not_mark_existing_column_changed() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -4338,6 +5038,9 @@ fn dameng_unchanged_identity_extra_does_not_mark_existing_column_changed() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -4598,6 +5301,9 @@ fn dameng_rejects_adding_second_identity_column() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.statements, Vec::<String>::new());
@@ -4657,6 +5363,9 @@ fn sqlserver_existing_column_identity_change_warns_without_unchanged_foreign_key
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.statements, Vec::<String>::new());
@@ -4695,6 +5404,9 @@ fn builds_duckdb_create_table_statements() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -4822,6 +5534,9 @@ fn builds_clickhouse_nullable_comment_and_reorder_statements() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -4875,6 +5590,9 @@ fn builds_h2_schema_qualified_existing_column_statements() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -5815,8 +6533,7 @@ fn mysql_clears_auto_increment_when_the_only_covering_index_is_rebuilt_by_the_sa
         result.statements,
         vec![
             "ALTER TABLE `users` DROP PRIMARY KEY, MODIFY COLUMN `id` bigint NOT NULL, ADD PRIMARY KEY (`external_id`);",
-            "DROP INDEX `idx_users_id` ON `users`;",
-            "CREATE UNIQUE INDEX `idx_users_id` ON `users` (`id`);",
+            "ALTER TABLE `users` DROP INDEX `idx_users_id`, ADD UNIQUE INDEX `idx_users_id` (`id`);",
         ]
     );
 }
@@ -6058,6 +6775,9 @@ fn mysql_create_table_with_auto_increment() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6092,6 +6812,9 @@ fn mysql_create_table_keeps_column_charset_collation_and_comment() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6130,6 +6853,9 @@ fn mysql_compatible_databases_do_not_emit_mysql_column_charset_clauses() {
             is_gaussdb_m_mode: false,
             table_collation: None,
             primary_key_name: None,
+            primary_key_change: None,
+            oracle_constraint_changes: None,
+            oracle_foreign_key_changes: None,
         });
 
         assert_eq!(result.warnings, Vec::<String>::new());
@@ -6165,6 +6891,9 @@ fn mysql_create_table_with_on_update_current_timestamp() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6235,6 +6964,150 @@ fn mysql_single_column_alter_carries_temporal_precision_into_current_timestamp_c
     assert_eq!(
         result.statements,
         vec!["ALTER TABLE `users` MODIFY COLUMN `updated_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3);"]
+    );
+}
+
+#[test]
+fn mysql_preset_default_with_on_update_clause_is_not_quoted() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `update_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP\n);"]
+    );
+}
+
+#[test]
+fn mysql_preset_on_update_default_supports_a_literal_default() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "'2020-01-01 00:00:00' ON UPDATE CURRENT_TIMESTAMP".to_string();
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `update_time` datetime NOT NULL DEFAULT '2020-01-01 00:00:00' ON UPDATE CURRENT_TIMESTAMP\n);"]
+    );
+}
+
+#[test]
+fn mysql_preset_on_update_with_unknown_expression_stays_quoted() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE foo".to_string();
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `update_time` datetime NOT NULL DEFAULT 'CURRENT_TIMESTAMP ON UPDATE foo'\n);"]
+    );
+}
+
+#[test]
+fn mysql_preset_on_update_default_carries_temporal_precision() {
+    let mut col = column("update_time");
+    col.data_type = "datetime(3)".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE `users` (\n  `update_time` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)\n);"]
+    );
+}
+
+#[test]
+fn mysql_preset_on_update_default_does_not_duplicate_the_extra_clause() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+    col.extra = Some(ColumnExtra { on_update_current_timestamp: Some(true), ..Default::default() });
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Mysql, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements[0].matches("ON UPDATE").count(), 1, "{}", result.statements[0]);
+}
+
+#[test]
+fn mysql_add_column_preset_default_with_on_update_clause_is_not_quoted() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+
+    let result =
+        build_table_structure_change_sql(structure_change_options(DatabaseType::Mysql, None, "sys_student", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE `sys_student` ADD COLUMN `update_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;"]
+    );
+}
+
+#[test]
+fn mysql_modify_column_preset_default_with_on_update_clause_is_not_quoted() {
+    let mut col = column("update_time");
+    col.data_type = "datetime".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+    col.original = Some(ColumnInfo {
+        name: "update_time".to_string(),
+        data_type: "datetime".to_string(),
+        is_nullable: false,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: None,
+        ..Default::default()
+    });
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Mysql),
+        driver_profile: None,
+        schema: None,
+        table_name: "sys_student".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE `sys_student` MODIFY COLUMN `update_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;"]
+    );
+}
+
+#[test]
+fn non_mysql_targets_keep_quoting_an_on_update_default_text() {
+    let mut col = column("update_time");
+    col.data_type = "timestamp".to_string();
+    col.is_nullable = false;
+    col.default_value = "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP".to_string();
+
+    let result = build_create_table_sql(structure_change_options(DatabaseType::Postgres, None, "users", vec![col]));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert!(
+        result.statements[0].contains("DEFAULT 'CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'"),
+        "{}",
+        result.statements[0]
     );
 }
 
@@ -6332,6 +7205,9 @@ fn postgres_create_table_with_identity() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6567,6 +7443,9 @@ fn dameng_create_table_with_identity() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6600,6 +7479,9 @@ fn dameng_create_table_preserves_character_length_units() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6641,10 +7523,60 @@ fn dameng_alter_column_preserves_character_length_unit() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
     assert_eq!(result.statements, vec!["ALTER TABLE \"SYSDBA\".\"USERS\" MODIFY (\"NAME\" VARCHAR2(64 BYTE));"]);
+}
+
+#[test]
+fn dameng_rename_column_uses_alter_column_rename_to() {
+    let mut renamed = column("NAME");
+    renamed.name = "NEW_NAME".to_string();
+    renamed.data_type = "VARCHAR2(64)".to_string();
+    renamed.original = Some(ColumnInfo {
+        name: "NAME".to_string(),
+        data_type: "VARCHAR2(64)".to_string(),
+        is_nullable: true,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: None,
+        ..Default::default()
+    });
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::Dameng),
+        driver_profile: None,
+        schema: Some("SYSDBA".to_string()),
+        table_name: "USERS".to_string(),
+        columns: vec![renamed],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+        mysql_engine: None,
+        mysql_auto_increment_value: None,
+        transwarp_create: None,
+        partitioned: false,
+        foreign_table: false,
+        is_gaussdb_m_mode: false,
+        table_collation: None,
+        primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE \"SYSDBA\".\"USERS\" ALTER COLUMN \"NAME\" RENAME TO \"NEW_NAME\";"]
+    );
 }
 
 #[test]
@@ -6683,6 +7615,9 @@ fn dameng_rejects_multiple_identity_columns() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert!(result.statements.is_empty());
@@ -6718,6 +7653,9 @@ fn dameng_rejects_zero_identity_increment() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert!(result.statements.is_empty());
@@ -6754,6 +7692,9 @@ fn sqlserver_create_table_with_identity() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6785,6 +7726,9 @@ fn mysql_quotes_datetime_literal_default() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6816,6 +7760,9 @@ fn mysql_does_not_quote_current_timestamp() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6848,6 +7795,9 @@ fn mysql_does_not_quote_temporal_function_with_parens() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6879,6 +7829,9 @@ fn mysql_date_literal_default_is_quoted() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6910,6 +7863,9 @@ fn mysql_time_literal_default_is_quoted() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -6941,6 +7897,9 @@ fn non_temporal_types_are_not_quoted() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7076,6 +8035,9 @@ fn builds_mysql_foreign_key_changes() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7112,6 +8074,9 @@ fn builds_mysql_composite_foreign_key() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7151,6 +8116,9 @@ fn builds_oracle_foreign_key_with_supported_actions() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7194,6 +8162,9 @@ fn builds_oracle_foreign_key_replacement() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7214,6 +8185,7 @@ fn builds_mysql_trigger_changes() {
         event: "UPDATE".to_string(),
         timing: "BEFORE".to_string(),
         statement: Some("SET NEW.updated_at = CURRENT_TIMESTAMP".to_string()),
+        condition: None,
         enabled: None,
     });
 
@@ -7236,6 +8208,9 @@ fn builds_mysql_trigger_changes() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7269,6 +8244,9 @@ fn builds_sqlserver_trigger_with_multiple_events() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7296,6 +8274,7 @@ fn rebuilds_changed_sqlserver_trigger_from_complete_metadata_source() {
             "CREATE TRIGGER dbo.orders_audit ON dbo.orders AFTER INSERT, UPDATE AS BEGIN SET NOCOUNT ON; INSERT INTO audit_log VALUES (0); END"
                 .to_string(),
         ),
+        condition: None,
         enabled: None,
     });
 
@@ -7318,6 +8297,9 @@ fn rebuilds_changed_sqlserver_trigger_from_complete_metadata_source() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7339,6 +8321,7 @@ fn sqlserver_trigger_edit_restores_disabled_state() {
         event: "INSERT".to_string(),
         timing: "AFTER".to_string(),
         statement: Some("CREATE TRIGGER dbo.orders_audit ON dbo.orders AFTER INSERT AS PRINT 'old'".to_string()),
+        condition: None,
         enabled: Some(false),
     });
 
@@ -7361,6 +8344,9 @@ fn sqlserver_trigger_edit_restores_disabled_state() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(
@@ -7388,6 +8374,7 @@ fn unchanged_postgres_trigger_does_not_block_column_rename() {
         event: "UPDATE".to_string(),
         timing: "AFTER".to_string(),
         statement: Some("EXECUTE FUNCTION audit_users()".to_string()),
+        condition: None,
         enabled: None,
     });
 
@@ -7410,6 +8397,9 @@ fn unchanged_postgres_trigger_does_not_block_column_rename() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7424,6 +8414,7 @@ fn changed_postgres_trigger_remains_unsupported() {
         event: "UPDATE".to_string(),
         timing: "AFTER".to_string(),
         statement: Some("EXECUTE FUNCTION audit_users()".to_string()),
+        condition: None,
         enabled: None,
     });
 
@@ -7446,6 +8437,9 @@ fn changed_postgres_trigger_remains_unsupported() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert!(result.statements.is_empty());
@@ -7477,6 +8471,9 @@ fn trigger_change_sql(
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     })
 }
 
@@ -7494,6 +8491,7 @@ fn existing_trigger(
         event: event.to_string(),
         timing: timing.to_string(),
         statement: Some(statement.to_string()),
+        condition: None,
         enabled,
     });
     existing
@@ -7566,6 +8564,96 @@ fn oracle_trigger_with_unstructured_source_can_still_toggle_enabled() {
 }
 
 #[test]
+fn creates_dameng_trigger() {
+    let result = trigger_change_sql(
+        DatabaseType::Dameng,
+        "APP",
+        "ORDERS",
+        vec![trigger("ORDERS_AUDIT", "BEFORE EACH ROW", "INSERT OR UPDATE", "BEGIN\n  NULL;\nEND;")],
+    );
+
+    assert_eq!(
+        result.statements,
+        vec![
+            "CREATE OR REPLACE TRIGGER \"APP\".\"ORDERS_AUDIT\" BEFORE INSERT OR UPDATE ON \"APP\".\"ORDERS\"\nFOR EACH ROW\nBEGIN\n  NULL;\nEND;"
+        ]
+    );
+    assert!(result.warnings.is_empty());
+}
+
+#[test]
+fn dameng_trigger_edit_rebuilds_with_create_or_replace() {
+    let mut existing = existing_trigger("ORDERS_AUDIT", "AFTER EACH ROW", "INSERT", "BEGIN\n  NULL;\nEND;", Some(true));
+    existing.statement = "BEGIN\n  DBMS_OUTPUT.PUT_LINE('x');\nEND;".to_string();
+
+    let result = trigger_change_sql(DatabaseType::Dameng, "APP", "ORDERS", vec![existing]);
+
+    assert_eq!(
+        result.statements,
+        vec![
+            "CREATE OR REPLACE TRIGGER \"APP\".\"ORDERS_AUDIT\" AFTER INSERT ON \"APP\".\"ORDERS\"\nFOR EACH ROW\nBEGIN\n  DBMS_OUTPUT.PUT_LINE('x');\nEND;"
+        ]
+    );
+    assert!(result.warnings.is_empty());
+}
+
+#[test]
+fn dameng_statement_trigger_keeps_statement_level_timing() {
+    // 达梦字典只给裸 BEFORE 时代表语句级（未写 FOR EACH），重建不能改成行级触发器。
+    let mut existing = existing_trigger("ORDERS_AUDIT", "BEFORE", "INSERT", "BEGIN\n  NULL;\nEND;", Some(true));
+    existing.statement = "BEGIN\n  DBMS_OUTPUT.PUT_LINE('x');\nEND;".to_string();
+
+    let result = trigger_change_sql(DatabaseType::Dameng, "APP", "ORDERS", vec![existing]);
+
+    assert_eq!(
+        result.statements,
+        vec![
+            "CREATE OR REPLACE TRIGGER \"APP\".\"ORDERS_AUDIT\" BEFORE INSERT ON \"APP\".\"ORDERS\"\nBEGIN\n  DBMS_OUTPUT.PUT_LINE('x');\nEND;"
+        ]
+    );
+    assert!(result.warnings.is_empty());
+}
+
+#[test]
+fn dameng_trigger_enabled_toggle_emits_alter_trigger() {
+    let mut existing = existing_trigger("ORDERS_AUDIT", "AFTER EACH ROW", "INSERT", "BEGIN NULL; END;", Some(true));
+    existing.enabled = Some(false);
+
+    let result = trigger_change_sql(DatabaseType::Dameng, "APP", "ORDERS", vec![existing]);
+
+    assert_eq!(result.statements, vec!["ALTER TRIGGER \"APP\".\"ORDERS_AUDIT\" DISABLE;"]);
+    assert!(result.warnings.is_empty());
+}
+
+#[test]
+fn rejects_editing_dameng_trigger_with_when_condition() {
+    let mut existing = existing_trigger("ORDERS_AUDIT", "BEFORE EACH ROW", "INSERT", "BEGIN NULL; END;", Some(true));
+    if let Some(original) = existing.original.as_mut() {
+        original.condition = Some("NEW.STATUS = 'OPEN'".to_string());
+    }
+    existing.statement = "BEGIN\n  NULL;\nEND;".to_string();
+
+    let result = trigger_change_sql(DatabaseType::Dameng, "APP", "ORDERS", vec![existing]);
+
+    assert!(result.statements.is_empty(), "unexpected statements: {:?}", result.statements);
+    assert_eq!(
+        result.warnings,
+        vec!["Editing existing Dameng trigger \"ORDERS_AUDIT\" requires its complete source definition."]
+    );
+}
+
+#[test]
+fn drops_existing_dameng_trigger() {
+    let mut existing = existing_trigger("ORDERS_AUDIT", "AFTER EACH ROW", "INSERT", "BEGIN NULL; END;", Some(true));
+    existing.marked_for_drop = true;
+
+    let result = trigger_change_sql(DatabaseType::Dameng, "APP", "ORDERS", vec![existing]);
+
+    assert_eq!(result.statements, vec!["DROP TRIGGER \"APP\".\"ORDERS_AUDIT\";"]);
+    assert!(result.warnings.is_empty());
+}
+
+#[test]
 fn sqlserver_trigger_enabled_toggle_emits_enable_disable_trigger() {
     let mut disable = existing_trigger("orders_audit", "AFTER", "INSERT", "BEGIN SET NOCOUNT ON; END", Some(true));
     disable.enabled = Some(false);
@@ -7597,6 +8685,7 @@ fn allows_editing_existing_oracle_trigger() {
         event: "INSERT OR UPDATE OR DELETE".to_string(),
         timing: "AFTER EACH ROW".to_string(),
         statement: Some("BEGIN\n  NULL;\nEND;".to_string()),
+        condition: None,
         enabled: None,
     });
 
@@ -7619,6 +8708,9 @@ fn allows_editing_existing_oracle_trigger() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(
@@ -7651,6 +8743,9 @@ fn builds_oracle_statement_trigger_without_row_clause() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7670,6 +8765,7 @@ fn drops_existing_oracle_trigger_without_reconstructing_it() {
         event: "INSERT".to_string(),
         timing: "AFTER EACH ROW".to_string(),
         statement: Some("BEGIN\n  NULL;\nEND;".to_string()),
+        condition: None,
         enabled: None,
     });
     existing.marked_for_drop = true;
@@ -7693,6 +8789,9 @@ fn drops_existing_oracle_trigger_without_reconstructing_it() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7720,6 +8819,9 @@ fn rejects_unsupported_oracle_compound_trigger_shape() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert!(result.statements.is_empty());
@@ -7751,6 +8853,9 @@ fn mysql_varchar_default_is_quoted() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7783,6 +8888,9 @@ fn mysql_char_default_is_quoted() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7816,6 +8924,9 @@ fn mysql_text_default_is_quoted() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7847,6 +8958,9 @@ fn mysql_enum_default_is_quoted() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -7878,6 +8992,9 @@ fn mysql_int_default_is_not_quoted() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -8019,6 +9136,9 @@ fn mysql_character_column_add_with_charset_collation() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -8140,6 +9260,9 @@ fn mysql_numeric_column_omits_charset_collation_in_column_definition() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -8189,6 +9312,9 @@ fn mysql_numeric_column_ignores_charset_collation_in_change_detection() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     // No ALTER should be emitted — charset/collation changes on
@@ -8233,6 +9359,9 @@ fn mysql_character_column_detects_charset_collation_change() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -8282,6 +9411,9 @@ fn mysql_character_column_preserves_charset_collation_on_other_change() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -8364,6 +9496,9 @@ fn mysql_inherited_column_charset_is_omitted_from_generated_ddl() {
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -8414,6 +9549,9 @@ fn mysql_explicit_column_charset_survives_the_table_default_comparison() {
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -8465,6 +9603,9 @@ fn mysql_inherited_column_charset_does_not_register_as_a_change() {
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -8509,6 +9650,9 @@ fn mysql_collation_switched_away_from_the_table_default_is_emitted() {
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -8558,6 +9702,9 @@ fn mysql_column_charset_switched_to_the_table_default_drops_the_clause() {
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -8604,6 +9751,9 @@ fn mysql_column_charset_is_kept_when_the_table_default_is_unknown() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -8645,6 +9795,9 @@ fn mysql_create_table_omits_inherited_column_charset() {
         is_gaussdb_m_mode: false,
         table_collation: Some("utf8mb4_0900_ai_ci".to_string()),
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -9355,6 +10508,9 @@ fn mysql_create_table_with_generated_column() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
         foreign_table: false,
     });
 
@@ -9402,6 +10558,9 @@ fn oscar_create_table_with_primary_key_and_comments() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -9580,6 +10739,9 @@ fn oscar_drop_index_with_schema_qualifier() {
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![],
         constraint_backed: false,
     });
@@ -9603,6 +10765,9 @@ fn oscar_drop_index_with_schema_qualifier() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -9630,6 +10795,9 @@ fn oscar_table_comment_uses_comment_on_table() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -9719,6 +10887,9 @@ fn postgres_partitioned_parent_concurrent_request_rejected() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     // Fail closed: PostgreSQL rejects CREATE INDEX CONCURRENTLY on a
@@ -9756,6 +10927,9 @@ fn postgres_partitioned_parent_plain_index_unchanged() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -9805,6 +10979,9 @@ fn postgres_create_table_partitioned_concurrent_request_rejected() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(
@@ -9938,6 +11115,9 @@ fn postgres_create_table_concurrent_index() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -10022,6 +11202,19 @@ fn pg_family_concurrent_flag_is_ignored() {
 }
 
 #[test]
+fn firebird_column_default_precedes_not_null() {
+    let mut col = column("raiz");
+    col.data_type = "varchar(20)".to_string();
+    col.is_nullable = false;
+    col.default_value = "'ECF'".to_string();
+
+    assert_eq!(
+        super::column_format::column_definition(StructureDialect::Postgres, &col, Some(DatabaseType::Firebird)),
+        "\"raiz\" varchar(20) DEFAULT 'ECF' NOT NULL"
+    );
+}
+
+#[test]
 fn non_postgres_concurrent_flag_is_ignored() {
     for database_type in [DatabaseType::Mysql, DatabaseType::Sqlite, DatabaseType::SqlServer] {
         let mut idx = index("idx_users_email", &["email"]);
@@ -10060,6 +11253,9 @@ fn gaussdb_m_options(columns: Vec<EditableStructureColumn>) -> TableStructureSql
         is_gaussdb_m_mode: true,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     }
 }
 
@@ -10077,6 +11273,7 @@ fn gaussdb_m_index(name: &str, columns: &[&str]) -> EditableStructureIndex {
         comment: String::new(),
         concurrently: false,
         original: None,
+        oracle_original_missing: false,
         marked_for_drop: false,
     }
 }
@@ -10100,6 +11297,9 @@ fn gaussdb_m_existing_index(
         included_columns: None,
         comment: None,
         key_is_expression: Vec::new(),
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![],
         constraint_backed: false,
     });
@@ -10300,6 +11500,9 @@ fn gaussdb_m_rebuild_index_unchanged_type_does_not_rebuild() {
         is_gaussdb_m_mode: true,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     };
     let result = build_table_structure_change_sql(options);
     assert!(result.warnings.is_empty());
@@ -10353,6 +11556,9 @@ fn mysql_create_table_nullable_timestamp_without_default_gets_explicit_null() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -10388,6 +11594,9 @@ fn mysql_create_table_nullable_timestamp_with_default_still_gets_explicit_null()
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -10421,6 +11630,9 @@ fn mysql_create_table_nullable_datetime_does_not_gain_null_keyword() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -10454,6 +11666,9 @@ fn mysql_add_column_nullable_timestamp_without_default_gets_explicit_null() {
         is_gaussdb_m_mode: false,
         table_collation: None,
         primary_key_name: None,
+        primary_key_change: None,
+        oracle_constraint_changes: None,
+        oracle_foreign_key_changes: None,
     });
 
     assert_eq!(result.warnings, Vec::<String>::new());
@@ -10492,6 +11707,9 @@ fn postgres_index_opclass_from_original_when_editable_empty() {
         included_columns: None,
         comment: None,
         key_is_expression: vec![false],
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![Some("gin_trgm_ops".to_string())],
         constraint_backed: false,
     });
@@ -10519,6 +11737,9 @@ fn postgres_index_no_rebuild_when_original_has_opclass_and_edit_is_identical() {
         included_columns: None,
         comment: None,
         key_is_expression: vec![false],
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![Some("gin_trgm_ops".to_string())],
         constraint_backed: false,
     });
@@ -10545,6 +11766,9 @@ fn postgres_index_rebuild_when_opclass_changed() {
         included_columns: None,
         comment: None,
         key_is_expression: vec![false],
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![None], // was default, now gin_trgm_ops
         constraint_backed: false,
     });
@@ -10644,6 +11868,9 @@ fn postgres_expression_index_appends_opclass() {
         included_columns: None,
         comment: None,
         key_is_expression: vec![true],
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![None],
         constraint_backed: false,
     });
@@ -10690,6 +11917,9 @@ fn postgres_expression_index_opclass_round_trips_from_indclass() {
         included_columns: None,
         comment: None,
         key_is_expression: vec![true],
+        key_directions: Vec::new(),
+        visibility: None,
+        key_metadata_complete: false,
         column_opclasses: vec![Some("public.gin_trgm_ops".to_string())],
         constraint_backed: false,
     });
@@ -11143,6 +12373,8 @@ fn starrocks_places_primary_keys_before_value_columns() {
 
 fn starrocks_layout_options(granularity: StarRocksTimeGranularity) -> CreateTableDialectOptions {
     CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: None,
             time_partition: Some(StarRocksTimePartition {
@@ -11242,6 +12474,8 @@ fn starrocks_validates_hash_keys_and_bucket_count() {
 #[test]
 fn starrocks_random_distribution_requires_duplicate_table_and_supported_version() {
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions { distribution: StarRocksDistribution::Random, ..Default::default() }),
     };
     let mut options = starrocks_partitioned_table_options();
@@ -11277,6 +12511,8 @@ fn starrocks_builds_multicolumn_value_and_list_partitions() {
     let options =
         structure_change_options(DatabaseType::StarRocks, None, "events", vec![column("city"), column("channel")]);
     let values = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::Values { column_ids: vec!["city".into(), "channel".into()] }),
             ..Default::default()
@@ -11286,6 +12522,8 @@ fn starrocks_builds_multicolumn_value_and_list_partitions() {
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     assert!(result.statements[0].contains("PARTITION BY (`city`, `channel`) DISTRIBUTED BY RANDOM"));
     let list = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::List {
                 column_ids: vec!["city".into(), "channel".into()],
@@ -11308,6 +12546,8 @@ fn starrocks_builds_range_bounds_and_validates_arity() {
     // Intentionally interleaved primary and value columns: SQL reorders without changing membership.
     options.columns.insert(1, column("payload"));
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::Range {
                 column_ids: vec!["ts".into(), "id".into()],
@@ -11359,6 +12599,8 @@ fn starrocks_time_slice_and_mixed_partitions_are_version_and_type_checked() {
 fn starrocks_rejects_duplicate_list_values_and_incompatible_partition_types() {
     let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![column("city")]);
     let list = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::List {
                 column_ids: vec!["city".into()],
@@ -11372,6 +12614,8 @@ fn starrocks_rejects_duplicate_list_values_and_incompatible_partition_types() {
     };
     assert!(build_create_table_sql_with_dialect_options(options.clone(), Some("3.5.0"), list).statements.is_empty());
     let range = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             partition: Some(StarRocksPartitionOptions::Range {
                 column_ids: vec!["city".into()],
@@ -11393,6 +12637,8 @@ fn starrocks_sort_columns_preserve_priority_and_allow_non_primary_columns() {
     options.columns[1].is_primary_key = false;
     options.columns[1].name = "event`time".into();
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions {
             sort_column_ids: vec!["ts".into(), "id".into()],
             ..Default::default()
@@ -11424,6 +12670,8 @@ fn starrocks_sort_validates_version_identity_and_primary_table_types() {
             _ => {}
         }
         let settings = CreateTableDialectOptions {
+            postgres_foreign_table: None,
+            mysql_table_charset: None,
             starrocks: Some(StarRocksCreateOptions { sort_column_ids: ids, ..Default::default() }),
         };
         let result = build_create_table_sql_with_dialect_options(options, version, settings);
@@ -11440,6 +12688,8 @@ fn starrocks_duplicate_sort_requires_33_and_allows_decimal() {
     }
     options.columns[1].data_type = "decimal(10,2)".into();
     let settings = CreateTableDialectOptions {
+        postgres_foreign_table: None,
+        mysql_table_charset: None,
         starrocks: Some(StarRocksCreateOptions { sort_column_ids: vec!["ts".into()], ..Default::default() }),
     };
     let old = build_create_table_sql_with_dialect_options(options.clone(), Some("3.2.0"), settings.clone());
@@ -12175,8 +13425,12 @@ fn mysql_create_table_start_value() {
         assert!(!result.warnings.is_empty(), "{value}");
     }
     options.mysql_auto_increment_value = Some("66".to_string());
-    options.driver_profile = Some("tidb".to_string());
+    options.driver_profile = Some("doris".to_string());
     assert!(build_create_table_sql(options.clone()).statements.is_empty());
+    options.driver_profile = Some("tidb".to_string());
+    let tidb_result = build_create_table_sql(options.clone());
+    assert!(tidb_result.warnings.is_empty());
+    assert!(tidb_result.statements.iter().any(|sql| sql.contains("AUTO_INCREMENT = 66")));
     options.driver_profile = None;
     options.columns[0].extra = None;
     assert!(build_create_table_sql(options).statements.is_empty());
